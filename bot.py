@@ -57,7 +57,10 @@ BREAKEVEN_FRACTION = 0.30
 # How often to check live prices for active trades (seconds)
 MONITOR_INTERVAL = 60
 
-BINANCE_PRICE_URL = "https://api.binance.com/api/v3/ticker/price"
+BYBIT_TICKERS_URL = "https://api.bybit.com/v5/market/tickers"
+# Bybit market categories to search for a pair, in order of preference:
+# linear = USDT perpetual futures (most leveraged pairs), spot = spot market
+BYBIT_CATEGORIES = ("linear", "spot")
 
 # Tried in order — first one that responds wins. The newest Flash models on the
 # free tier intermittently return 503 (high demand), so we keep fallbacks.
@@ -305,11 +308,34 @@ def validate(data: TradeData) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Live price monitoring (Binance public API — crypto pairs only)
+# Live price monitoring (Bybit public API — no key required)
 # ---------------------------------------------------------------------------
 
-async def resolve_binance_symbol(asset: str) -> Optional[str]:
-    """Map an asset like BTCUSD to a Binance symbol like BTCUSDT, if it exists."""
+async def fetch_bybit_price(
+    http: httpx.AsyncClient, symbol: str, category: str
+) -> Optional[float]:
+    """Last traded price for a Bybit symbol, or None if unavailable."""
+    try:
+        r = await http.get(
+            BYBIT_TICKERS_URL, params={"category": category, "symbol": symbol}
+        )
+        payload = r.json()
+    except (httpx.HTTPError, ValueError):
+        return None
+    # Bybit returns HTTP 200 even for unknown symbols; retCode signals success
+    if payload.get("retCode") != 0:
+        return None
+    tickers = (payload.get("result") or {}).get("list") or []
+    if not tickers:
+        return None
+    try:
+        return float(tickers[0]["lastPrice"])
+    except (KeyError, ValueError):
+        return None
+
+
+async def resolve_bybit_symbol(asset: str) -> Optional[tuple[str, str]]:
+    """Map an asset like BTCUSD to a Bybit (symbol, category), if it exists."""
     compact = asset.upper().replace("/", "").replace(" ", "").replace("-", "")
     if compact.endswith("USDT"):
         candidates = [compact]
@@ -320,12 +346,9 @@ async def resolve_binance_symbol(asset: str) -> Optional[str]:
 
     async with httpx.AsyncClient(timeout=10) as http:
         for symbol in candidates:
-            try:
-                r = await http.get(BINANCE_PRICE_URL, params={"symbol": symbol})
-            except httpx.HTTPError:
-                return None
-            if r.status_code == 200:
-                return symbol
+            for category in BYBIT_CATEGORIES:
+                if await fetch_bybit_price(http, symbol, category) is not None:
+                    return symbol, category
     return None
 
 
@@ -381,11 +404,10 @@ async def monitor_trades(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     async with httpx.AsyncClient(timeout=10) as http:
         for trade in list(trades):
-            try:
-                r = await http.get(BINANCE_PRICE_URL, params={"symbol": trade["symbol"]})
-                r.raise_for_status()
-                price = float(r.json()["price"])
-            except (httpx.HTTPError, KeyError, ValueError):
+            price = await fetch_bybit_price(
+                http, trade["symbol"], trade.get("category", "linear")
+            )
+            if price is None:
                 continue
 
             event = check_trade(trade, price)
@@ -496,16 +518,18 @@ async def handle_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
         await message.reply_text(build_signal_message(data))
 
-        # Register the trade for live monitoring (crypto pairs on Binance only)
-        symbol = await resolve_binance_symbol(data.asset)
+        # Register the trade for live monitoring (pairs listed on Bybit)
+        resolved = await resolve_bybit_symbol(data.asset)
         decimals = signal_decimals(data)
         be_price = breakeven_price(data)
         profit, loss = calculate_percentages(data)
-        if symbol:
+        if resolved:
+            symbol, category = resolved
             state["trades"].append({
                 "chat_id": message.chat_id,
                 "asset": data.asset.upper(),
                 "symbol": symbol,
+                "category": category,
                 "direction": data.direction,
                 "entry": data.entry,
                 "sl": data.stop_loss,
@@ -526,7 +550,7 @@ async def handle_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         else:
             await message.reply_text(
                 f"ℹ️ Live monitoring isn't available for {data.asset.upper()} "
-                "(no matching Binance pair) — breakeven/TP/SL alerts are off "
+                "(no matching Bybit pair) — breakeven/TP/SL alerts are off "
                 "for this trade."
             )
     except Exception:
@@ -557,9 +581,14 @@ def main() -> None:
 
     # Background jobs: trade monitoring + daily morning motivation
     app.job_queue.run_repeating(monitor_trades, interval=MONITOR_INTERVAL, first=10)
+    try:
+        tz = pytz.timezone(TIMEZONE)
+    except pytz.UnknownTimeZoneError:
+        logger.warning("Unknown TIMEZONE %r, falling back to UTC", TIMEZONE)
+        tz = pytz.utc
     app.job_queue.run_daily(
         morning_motivation,
-        time=dtime(hour=MORNING_HOUR, tzinfo=pytz.timezone(TIMEZONE)),
+        time=dtime(hour=MORNING_HOUR, tzinfo=tz),
     )
 
     # On Render (and similar hosts) RENDER_EXTERNAL_URL is set automatically:

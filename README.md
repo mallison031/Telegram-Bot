@@ -75,7 +75,7 @@ drawn on it — you'll get the formatted signal back in a few seconds.
 
 - **Chart signals** — send a chart screenshot, get the formatted signal back.
 - **Breakeven alert** — after a signal, the bot watches the live price
-  (Binance public API) and messages you to move SL to breakeven once price
+  (Bybit public API) and messages you to move SL to breakeven once price
   covers **30% of the distance from entry to TP**.
 - **TP/SL result messages** — when the trade hits take profit or stop loss,
   the bot sends a motivation message (and stops monitoring that trade).
@@ -83,9 +83,10 @@ drawn on it — you'll get the formatted signal back in a few seconds.
   at `MORNING_HOUR` (default 8:00, timezone via `TIMEZONE` env var) to every
   chat that has used the bot.
 
-> Live monitoring works for assets with a matching Binance pair (crypto like
-> BTCUSD/ETHUSD, plus some forex like EURUSD via EURUSDT). For anything else
-> the bot says monitoring is unavailable and still sends the signal.
+> Live monitoring works for assets with a matching Bybit pair — all major
+> crypto (BTCUSD, ETHUSD, ...) and gold (XAUUSD via the XAUUSDT perpetual).
+> Forex pairs like EURUSD aren't listed on Bybit; for those the bot says
+> monitoring is unavailable and still sends the signal.
 
 ## How it works
 
