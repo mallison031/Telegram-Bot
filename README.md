@@ -108,6 +108,68 @@ drawn on it — you'll get the formatted signal back in a few seconds.
   formulas), deduces the order type (LIMIT/STOP) by comparing entry to the
   current price, validates that the setup is coherent, and formats the reply.
 
+## How the Telegram side works
+
+Telegram bots never talk to users directly — everything goes through
+Telegram's **Bot API** servers, authenticated by the bot token from BotFather.
+
+### The message flow, step by step
+
+```
+You (Telegram app)                Telegram servers                 This bot
+       |                                 |                            |
+       |  1. send chart photo            |                            |
+       |-------------------------------->|                            |
+       |                                 |  2. "update" (JSON)        |
+       |                                 |--------------------------->|
+       |                                 |  3. getFile + download     |
+       |                                 |<---------------------------|
+       |                                 |       (bot sends image to Gemini,
+       |                                 |        does the math locally)
+       |                                 |  4. sendMessage (signal)   |
+       |                                 |<---------------------------|
+       |  5. signal appears in chat      |                            |
+       |<--------------------------------|                            |
+```
+
+1. **You send a photo** to the bot chat. Telegram stores the image on its
+   servers and creates an *update* — a JSON object describing the new message.
+2. **The bot receives the update** in one of two ways (chosen automatically
+   in `main()`):
+   - **Polling (local runs):** the bot repeatedly calls `getUpdates`,
+     a long-poll HTTP request that returns as soon as something arrives.
+     Outbound-only — works behind any firewall, no public URL needed.
+   - **Webhook (on Render):** the bot registers its public URL with Telegram
+     once at startup (`setWebhook`), and Telegram then POSTs each update to
+     `https://<app>.onrender.com/telegram`. Requests are verified with a
+     secret token so only Telegram can trigger the bot. Failed deliveries
+     (e.g. while the free service wakes from sleep) are retried by Telegram.
+3. **The bot downloads the image** via the Bot API (`getFile`), since updates
+   only carry a file reference, not the image bytes themselves.
+4. **The bot replies** with `sendMessage` to the chat the photo came from
+   (`chat_id` in the update). Handler routing in `main()` decides what runs:
+   photos/image files → chart analysis; `/start` → the welcome text; anything
+   else → no handler, so no reply.
+5. **Push messages without an incoming message:** for breakeven/TP/SL alerts
+   and the morning motivation, the bot calls `sendMessage` on its own using
+   the `chat_id`s it saved in `state.json` — a bot may message any chat where
+   the user has already started a conversation with it. (This also means the
+   bot cannot message anyone who has never opened it — Telegram forbids
+   unsolicited first contact.)
+
+### Good to know
+
+- **One consumer at a time:** a bot token supports either an active webhook
+  *or* polling — not both at once. That's why local runs require stopping the
+  Render deployment first (see *Switching back to local runs* below).
+- **Groups:** the bot works in group chats too, but by default BotFather's
+  *privacy mode* means it only sees photos sent as replies to it or messages
+  mentioning it. Disable privacy mode via BotFather (`/setprivacy`) if you
+  want it to react to every chart posted in a group.
+- **Photos vs. files:** Telegram re-compresses photos to JPEG; sending the
+  screenshot as a *file/document* preserves full quality, which can help
+  Gemini read small price labels. The bot accepts both.
+
 ## Hosting free on Render
 
 The bot has two modes, picked automatically:
