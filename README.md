@@ -71,6 +71,22 @@ drawn on it — you'll get the formatted signal back in a few seconds.
 
   Check `bot.log` for output; stop it later with `pkill -f bot.py`.
 
+## Features
+
+- **Chart signals** — send a chart screenshot, get the formatted signal back.
+- **Breakeven alert** — after a signal, the bot watches the live price
+  (Binance public API) and messages you to move SL to breakeven once price
+  covers **30% of the distance from entry to TP**.
+- **TP/SL result messages** — when the trade hits take profit or stop loss,
+  the bot sends a motivation message (and stops monitoring that trade).
+- **Morning motivation** — a fresh Gemini-written motivation text every day
+  at `MORNING_HOUR` (default 8:00, timezone via `TIMEZONE` env var) to every
+  chat that has used the bot.
+
+> Live monitoring works for assets with a matching Binance pair (crypto like
+> BTCUSD/ETHUSD, plus some forex like EURUSD via EURUSDT). For anything else
+> the bot says monitoring is unavailable and still sends the signal.
+
 ## How it works
 
 - **The bot responds to chart images only.** Text messages get no reply, and
@@ -115,6 +131,24 @@ The bot has two modes, picked automatically:
    - `GEMINI_API_KEY`
 4. Deploy. Once live, the bot registers its own webhook with Telegram —
    no manual webhook setup needed. Send `/start` to the bot to confirm.
+
+### Keep the service awake (required for monitoring & morning texts)
+
+A sleeping service can't watch live prices or send scheduled messages, so set
+up a free uptime pinger to keep it awake 24/7:
+
+1. Sign up at [uptimerobot.com](https://uptimerobot.com) (free) — or
+   [cron-job.org](https://cron-job.org).
+2. Add an HTTP(S) monitor pointing at your Render URL
+   (`https://<your-app>.onrender.com/`) with a **5-minute interval**.
+
+That's it — the pings stop Render from ever idling the service. One always-on
+service uses ~730 of the free plan's 750 instance-hours per month, so it fits.
+
+> Note: active trades and the subscriber list are stored in a local
+> `state.json`. On Render's free tier this file is wiped on every redeploy or
+> restart — monitored trades are forgotten then (re-send the chart to
+> re-register). Fine for personal use.
 
 ### Updating the bot
 
