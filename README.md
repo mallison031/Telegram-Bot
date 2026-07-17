@@ -73,6 +73,10 @@ drawn on it — you'll get the formatted signal back in a few seconds.
 
 ## How it works
 
+- **The bot responds to chart images only.** Text messages get no reply, and
+  images that aren't a trading chart with a position tool are silently ignored
+  (Gemini classifies each image before extraction). `/start` shows a short
+  usage hint.
 - `bot.py` polls Telegram for messages. Photos (and image files) are downloaded
   and sent to **Gemini Flash** with a prompt describing how to read a
   TradingView-style position tool (red box = stop loss, green/blue box = take

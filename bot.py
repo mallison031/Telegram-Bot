@@ -54,8 +54,23 @@ logger = logging.getLogger(__name__)
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 
+class ChartAnalysis(BaseModel):
+    """Raw values Gemini extracts from the image. All math happens in code.
+
+    is_trading_chart gates everything: when False the bot stays silent.
+    """
+
+    is_trading_chart: bool
+    asset: Optional[str] = None
+    direction: Optional[Literal["LONG", "SHORT"]] = None
+    entry: Optional[float] = None
+    stop_loss: Optional[float] = None
+    take_profit: Optional[float] = None
+    current_price: Optional[float] = None
+
+
 class TradeData(BaseModel):
-    """Raw values Gemini extracts from the chart. All math happens in code."""
+    """A complete, validated trade setup extracted from a chart."""
 
     asset: str
     direction: Literal["LONG", "SHORT"]
@@ -66,8 +81,15 @@ class TradeData(BaseModel):
 
 
 VISION_PROMPT = """\
-You are analyzing a screenshot of a trading chart (e.g. TradingView) that has a \
-long/short position tool drawn on it.
+You are analyzing an image that should be a screenshot of a trading chart \
+(e.g. TradingView) with a long/short position tool drawn on it.
+
+First decide: is this actually a trading chart with a visible position tool \
+(entry, stop loss, and take profit levels)? If it is NOT — any other kind of \
+image, or a chart without a position tool, or a chart whose price levels are \
+unreadable — set is_trading_chart to false and leave every other field null.
+
+If it IS such a chart, set is_trading_chart to true and extract the values.
 
 How to read the chart:
 - The asset name is usually in the top-left corner (e.g. "Bitcoin / U.S. Dollar" \
@@ -162,7 +184,7 @@ def validate(data: TradeData) -> Optional[str]:
     return None
 
 
-def extract_trade_data(image_bytes: bytes, mime_type: str) -> TradeData:
+def extract_chart_analysis(image_bytes: bytes, mime_type: str) -> ChartAnalysis:
     """Call Gemini vision with enforced structured JSON output (sync).
 
     Tries each model in GEMINI_MODELS until one responds — free-tier models
@@ -179,7 +201,7 @@ def extract_trade_data(image_bytes: bytes, mime_type: str) -> TradeData:
                 ],
                 config=genai_types.GenerateContentConfig(
                     response_mime_type="application/json",
-                    response_schema=TradeData,
+                    response_schema=ChartAnalysis,
                     temperature=0,
                 ),
             )
@@ -188,10 +210,28 @@ def extract_trade_data(image_bytes: bytes, mime_type: str) -> TradeData:
             last_error = error
             continue
         parsed = response.parsed
-        if isinstance(parsed, TradeData):
+        if isinstance(parsed, ChartAnalysis):
             return parsed
-        return TradeData.model_validate_json(response.text)
+        return ChartAnalysis.model_validate_json(response.text)
     raise last_error if last_error else RuntimeError("No Gemini model available")
+
+
+def to_trade_data(analysis: ChartAnalysis) -> Optional[TradeData]:
+    """Return a complete TradeData, or None if the image isn't a usable chart."""
+    if not analysis.is_trading_chart:
+        return None
+    required = (analysis.asset, analysis.direction, analysis.entry,
+                analysis.stop_loss, analysis.take_profit)
+    if any(value is None for value in required):
+        return None
+    return TradeData(
+        asset=analysis.asset,
+        direction=analysis.direction,
+        entry=analysis.entry,
+        stop_loss=analysis.stop_loss,
+        take_profit=analysis.take_profit,
+        current_price=analysis.current_price,
+    )
 
 
 async def handle_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -208,26 +248,30 @@ async def handle_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
-    status = await message.reply_text("🔍 Analyzing chart...")
 
     try:
         image_bytes = bytes(await file.download_as_bytearray())
-        data = await asyncio.to_thread(extract_trade_data, image_bytes, mime_type)
+        analysis = await asyncio.to_thread(extract_chart_analysis, image_bytes, mime_type)
+
+        data = to_trade_data(analysis)
+        if data is None:
+            # Not a trading chart — stay silent per bot policy
+            logger.info("Ignored non-chart image in chat %s", message.chat_id)
+            return
 
         error = validate(data)
         if error:
-            await status.edit_text(
+            await message.reply_text(
                 f"⚠️ Couldn't read a valid setup from this chart.\n{error}\n"
                 "Make sure the position tool with entry/SL/TP is clearly visible."
             )
             return
 
-        await status.edit_text(build_signal_message(data))
+        await message.reply_text(build_signal_message(data))
     except Exception:
         logger.exception("Failed to process chart")
-        await status.edit_text(
-            "❌ Sorry, I couldn't process that image. "
-            "Please send a clear screenshot of a chart with a position tool drawn on it."
+        await message.reply_text(
+            "❌ Sorry, I couldn't process that image right now. Please try again."
         )
 
 
@@ -239,18 +283,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-async def handle_other(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text(
-        "Please send a chart screenshot (as a photo or image file). Use /start for help."
-    )
-
-
 def main() -> None:
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
+    # Chart images only — text and any other message types are ignored
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_chart))
-    app.add_handler(MessageHandler(~filters.COMMAND, handle_other))
 
     # On Render (and similar hosts) RENDER_EXTERNAL_URL is set automatically:
     # run in webhook mode so incoming Telegram messages wake the free service.
