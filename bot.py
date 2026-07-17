@@ -11,7 +11,7 @@ trusting the AI with math), and replies with a formatted signal:
     Profit: +[X]% / Loss: -[Y]%
 
 Extra features:
-- Live trade monitoring (Binance public API): alerts to move SL to breakeven
+- Live trade monitoring (Bybit public API): alerts to move SL to breakeven
   once price covers 30% of the distance to TP, and sends a motivation message
   when TP or SL is hit.
 - Daily morning motivation text to every chat that has used the bot.
