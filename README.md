@@ -80,7 +80,7 @@ drawn on it — you'll get the formatted signal back in a few seconds.
   filled. If price runs to TP without ever filling, it tells you the setup
   played out without you instead of claiming a win you never took.
 - **Breakeven alert** — once the trade is live, the bot watches the price
-  (OANDA, or Bybit for crypto) and messages you to move SL to breakeven once
+  (Bybit public API) and messages you to move SL to breakeven once
   price covers **30% of the distance from entry to TP**.
 - **TP/SL result messages** — when the trade hits take profit or stop loss,
   the bot sends a motivation message (and stops monitoring that trade).
@@ -109,30 +109,34 @@ The command menu is registered with Telegram automatically at startup.
 
 | Instruments | Provider | Needs |
 | --- | --- | --- |
-| Forex (EURUSD…), metals (XAUUSD), indices (US30, NAS100), oil | OANDA | `OANDA_ACCESS_TOKEN` |
-| Crypto (BTCUSD, ETHUSD…) | Bybit | nothing — public API |
+| Crypto (BTCUSD, ETHUSD, SOLUSD…) | ✅ monitored | `BTCUSDT` etc. |
+| Gold and silver (XAUUSD, XAGUSD) | ✅ monitored | `XAUUSDT`, `XAGUSDT` |
+| Forex (EURUSD, GBPUSD…), stock indices, oil | ❌ not monitored | not listed on Bybit |
 
-OANDA is tried first and covers everything a retail forex chart is likely to
-show; Bybit picks up crypto, which OANDA does not list. If neither carries the
-instrument, the bot still sends the signal and just says monitoring is off for
-that trade.
+Prices come from Bybit's public API — no key, no account, no rate-limit
+worries. Charts Bybit doesn't list still get a signal; they just don't get
+breakeven/TP/SL alerts.
 
-#### Getting an OANDA token
+#### How a chart maps to a Bybit pair
 
-1. Sign up at [oanda.com](https://www.oanda.com/). A **practice** account is
-   free and needs no deposit.
-2. In the account portal, open **Manage API Access** and generate a personal
-   access token. Copy it — it is shown once.
-3. Put it in `.env` (and in Render's environment variables):
-   `OANDA_ACCESS_TOKEN=…` plus `OANDA_ENV=practice` (or `live`).
+Bybit names pairs its own way: a chart labelled `BTCUSD` is `BTCUSDT` there,
+and `XAUUSD` is `XAUUSDT`. Rather than guess a suffix, the bot **downloads
+Bybit's real pair list** (755 linear + 592 spot at the time of writing),
+caches it for 6 hours, and matches the chart's asset against it.
 
-> **A practice token gives real live prices.** OANDA's practice environment
-> carries the same market feed as the live one — only *order execution* is
-> simulated, and this bot never places orders. It only reads prices, so the
-> data is identical to a funded account's.
+That matters for correctness, not just tidiness: a constructed name can
+collide with a real but unrelated market. `SPXUSDT` exists on Bybit — it is a
+memecoin, not the S&P 500. Matching against the live list, and rejecting what
+isn't there, avoids pricing your index trade against a coin that shares a
+ticker prefix.
 
-The account ID is discovered automatically from the token. If your token has
-several accounts and you want a specific one, set `OANDA_ACCOUNT_ID`.
+> **Bybit's `+` forex pairs (`EURUSD+`, `GBPUSD+`) are not reachable here.**
+> Those belong to Bybit's separate MetaTrader 5 forex product, and MT5
+> symbols are not served by the public v5 REST API — a full scan of all 1,370
+> instruments across the linear, inverse and spot categories returns only
+> `XAUUSDT` and `XAGUSDT` as non-crypto. MT5 is reachable only through the
+> MetaTrader terminal, whose Python bridge is Windows-only and cannot run on
+> Render.
 
 ## How it works
 
@@ -158,11 +162,11 @@ several accounts and you want a specific one, set `OANDA_ACCOUNT_ID`.
   LIMIT/STOP order waits for price to reach entry before any breakeven/TP/SL
   alert can fire. Every 60 s a background job checks each monitored trade
   against the live price and advances it through those states.
-- **OANDA prices** come from `GET /v3/accounts/{id}/pricing`, whose
-  `instruments` parameter takes a comma-separated list — so one request per
-  cycle covers every open trade no matter how many there are. The account ID
-  and its tradeable instrument list are fetched once and cached, and asset
-  names are matched against that real list rather than guessed at.
+- **Pair resolution** downloads Bybit's full symbol list per market category
+  (cached 6 h) and matches the chart's asset against it, preferring `linear`
+  (USDT perpetuals) over `spot`. Per-cycle pricing then uses a targeted
+  single-symbol call, because the full linear ticker payload is ~550 KB and
+  fetching that every minute would be wasteful.
 - **The scheduled texts are state-driven, not timer-driven.** The bot records
   the date each text was last sent in `state.json` and checks every 5 minutes
   whether today's is still outstanding. A one-shot daily timer is silently
@@ -254,7 +258,7 @@ The bot has two modes, picked automatically:
    - `TELEGRAM_BOT_TOKEN`, `GEMINI_API_KEY` — required
    - `TIMEZONE` — set it (e.g. `Africa/Lagos`), or the scheduled texts run on
      UTC and arrive at the wrong local hour
-   - `OANDA_ACCESS_TOKEN` — optional, enables forex/metals/indices monitoring
+   - live prices need no key — Bybit's API is public
 4. Deploy. Once live, the bot registers its own webhook with Telegram —
    no manual webhook setup needed. Send `/start` to the bot to confirm.
 
@@ -299,11 +303,11 @@ service uses ~730 of the free plan's 750 instance-hours per month, so it fits.
    `state.json`. That list is lost when the free-tier filesystem resets;
    sending any message to the bot re-registers the chat.
 
-**A trade says monitoring is unavailable.** The instrument wasn't found at
-either provider. Forex, metals and indices need `OANDA_ACCESS_TOKEN`; check
-the startup log line beginning `Live prices:` to see whether OANDA is active.
-A rejected token logs `OANDA rejected the token (HTTP 401)` — usually
-`OANDA_ENV` not matching the account the token came from.
+**A trade says monitoring is unavailable.** Bybit doesn't list a pair for that
+asset. Expected for forex and stock indices — see the coverage table above.
+For a crypto pair you believe exists, check the startup log for
+`Bybit lists N linear pairs`; if that line is missing or N is 0, the pair
+list couldn't be downloaded and every asset will be rejected.
 
 ### Updating the bot
 

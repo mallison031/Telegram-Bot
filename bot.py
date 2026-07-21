@@ -11,9 +11,10 @@ trusting the AI with math), and replies with a formatted signal:
     Profit: +[X]% / Loss: -[Y]%
 
 Extra features:
-- Live trade monitoring (OANDA v20 REST API, with Bybit as a crypto fallback):
-  alerts when a pending order fills, when to move SL to breakeven once price
-  covers 30% of the distance to TP, and a motivation message on TP or SL.
+- Live trade monitoring (Bybit public API, no key): alerts when a pending
+  order fills, when to move SL to breakeven once price covers 30% of the
+  distance to TP, and a motivation message on TP or SL. Chart assets are
+  matched against Bybit's real pair list rather than a guessed suffix.
 - Morning and night motivation texts to every chat that has used the bot.
   Delivery is state-driven rather than a fixed timer, so a message missed
   while the host was asleep is still sent when the bot wakes up.
@@ -25,6 +26,7 @@ import logging
 import os
 import random
 import re
+import time
 from datetime import datetime, timedelta
 from datetime import timezone as dt_timezone
 from pathlib import Path
@@ -57,14 +59,6 @@ MORNING_HOUR = int(os.environ.get("MORNING_HOUR", "8"))
 NIGHT_HOUR = int(os.environ.get("NIGHT_HOUR", "22"))
 STATE_FILE = Path(os.environ.get("STATE_FILE", "state.json"))
 
-# OANDA credentials. Generate a personal access token in the OANDA account
-# portal -> Manage API Access. A practice token carries the same live prices
-# as a live one. Without a token OANDA is skipped and Bybit is used alone.
-OANDA_ACCESS_TOKEN = os.environ.get("OANDA_ACCESS_TOKEN", "").strip()
-OANDA_ENV = os.environ.get("OANDA_ENV", "practice").strip().lower()
-# Optional: pin a specific account. Left blank, the first one is used.
-OANDA_ACCOUNT_ID = os.environ.get("OANDA_ACCOUNT_ID", "").strip()
-
 # Fraction of the entry->TP distance that triggers the breakeven alert
 BREAKEVEN_FRACTION = 0.30
 # How often to check live prices for active trades (seconds)
@@ -82,12 +76,6 @@ SCHEDULE_INTERVAL = 300
 # A scheduled text more than this many hours late is dropped rather than sent
 # at a nonsensical time (e.g. the morning text arriving at 6pm).
 CATCHUP_HOURS = 6
-
-OANDA_HOST = (
-    "api-fxpractice.oanda.com" if OANDA_ENV == "practice"
-    else "api-fxtrade.oanda.com"
-)
-OANDA_BASE_URL = f"https://{OANDA_HOST}"
 
 BYBIT_TICKERS_URL = "https://api.bybit.com/v5/market/tickers"
 # Bybit market categories to search for a pair, in order of preference:
@@ -373,187 +361,86 @@ def validate(data: TradeData) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Live prices, provider 1: OANDA v20 REST API (needs OANDA_ACCESS_TOKEN)
+# Live prices: Bybit public API (no key, no account)
 #
-# A practice token carries the same live market feed as a live one — only
-# order execution differs, and this bot never places orders. The pricing
-# endpoint takes a CSV list of instruments, so one request per cycle prices
-# every open trade no matter how many there are.
+# Bybit names its pairs its own way: a chart labelled BTCUSD or XAUUSD is
+# BTCUSDT / XAUUSDT here. Rather than guess a suffix and hope, the bot
+# downloads Bybit's real symbol list per market category and matches against
+# it — the list is authoritative and catches renames and new listings.
+#
+# The list is only used to resolve a chart to a pair. Per-cycle pricing stays
+# a targeted per-symbol call, because the full linear ticker payload is ~550KB
+# and fetching that every minute would be absurd.
 # ---------------------------------------------------------------------------
 
-# OANDA names instruments "EUR_USD", "XAU_USD", "US30_USD". Anything not
-# listed here falls back to the generic 6-letter -> "XXX_YYY" rule, and every
-# candidate is checked against the account's real instrument list anyway.
-OANDA_ALIASES = {
-    "XAUUSD": "XAU_USD", "GOLD": "XAU_USD",
-    "XAGUSD": "XAG_USD", "SILVER": "XAG_USD",
-    "USOIL": "WTICO_USD", "WTI": "WTICO_USD", "CRUDE": "WTICO_USD",
-    "UKOIL": "BCO_USD", "BRENT": "BCO_USD", "NATGAS": "NATGAS_USD",
-    "US30": "US30_USD", "DJI": "US30_USD", "DOW": "US30_USD",
-    "NAS100": "NAS100_USD", "USTEC": "NAS100_USD", "NASDAQ": "NAS100_USD",
-    "SPX500": "SPX500_USD", "US500": "SPX500_USD", "SP500": "SPX500_USD",
-    "GER30": "DE30_EUR", "GER40": "DE30_EUR", "DAX": "DE30_EUR",
-    "UK100": "UK100_GBP", "FTSE": "UK100_GBP",
-    "JPN225": "JP225_USD", "NIKKEI": "JP225_USD",
-    "AUS200": "AU200_AUD", "HK50": "HK33_HKD",
-}
+# Cache the symbol list this long before refetching (seconds)
+BYBIT_SYMBOLS_TTL = 6 * 3600
 
-_oanda_account_id: Optional[str] = None
-_oanda_instruments: Optional[set[str]] = None
-
-
-def oanda_enabled() -> bool:
-    return bool(OANDA_ACCESS_TOKEN)
-
-
-def oanda_headers() -> dict:
-    return {
-        "Authorization": f"Bearer {OANDA_ACCESS_TOKEN}",
-        "Accept-Datetime-Format": "RFC3339",
-    }
+_bybit_symbols: dict[str, set[str]] = {}
+_bybit_symbols_at: dict[str, float] = {}
 
 
 def normalize_asset(asset: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", asset.upper())
 
 
-def oanda_symbol_candidates(asset: str) -> list[str]:
-    """OANDA instrument names to try for an asset like 'EURUSD' or 'XAUUSD'."""
+def bybit_symbol_candidates(asset: str) -> list[str]:
+    """Bybit pair names to try for an asset like 'BTCUSD' or 'XAUUSD'.
+
+    Order matters: the first candidate that Bybit actually lists wins.
+    """
     compact = normalize_asset(asset)
     candidates = []
-    if compact in OANDA_ALIASES:
-        candidates.append(OANDA_ALIASES[compact])
-    # Crypto charts often read as USDT pairs; OANDA quotes them against USD
+
     if compact.endswith("USDT"):
-        compact = compact[:-1]
-    if len(compact) == 6:
-        candidates.append(f"{compact[:3]}_{compact[3:]}")
-    candidates.append(compact)
-    return list(dict.fromkeys(candidates))
-
-
-def oanda_price(row: dict) -> Optional[float]:
-    """Mid price from an OANDA price row, preferring the closeout quotes."""
-    def mid(bid, ask) -> Optional[float]:
-        try:
-            bid, ask = float(bid), float(ask)
-        except (TypeError, ValueError):
-            return None
-        return (bid + ask) / 2 if bid > 0 and ask > 0 else None
-
-    price = mid(row.get("closeoutBid"), row.get("closeoutAsk"))
-    if price is not None:
-        return price
-    try:
-        return mid(row["bids"][0]["price"], row["asks"][0]["price"])
-    except (KeyError, IndexError, TypeError):
-        return None
-
-
-async def oanda_get(http: httpx.AsyncClient, path: str, **params) -> Optional[dict]:
-    """GET an OANDA endpoint, returning parsed JSON or None on any failure."""
-    try:
-        response = await http.get(
-            f"{OANDA_BASE_URL}{path}", params=params or None, headers=oanda_headers()
-        )
-    except httpx.HTTPError as error:
-        logger.warning("OANDA request to %s failed: %s", path, error)
-        return None
-
-    if response.status_code in (401, 403):
-        logger.warning(
-            "OANDA rejected the token (HTTP %s) — check OANDA_ACCESS_TOKEN and "
-            "OANDA_ENV (%s, host %s)",
-            response.status_code, OANDA_ENV, OANDA_HOST,
-        )
-        return None
-    if response.status_code != 200:
-        logger.warning("OANDA %s returned HTTP %s", path, response.status_code)
-        return None
-    try:
-        return response.json()
-    except ValueError:
-        logger.warning("OANDA %s returned a non-JSON response", path)
-        return None
-
-
-async def oanda_account_id(http: httpx.AsyncClient) -> Optional[str]:
-    """The account to price against — from config, else the first one found."""
-    global _oanda_account_id
-    if _oanda_account_id:
-        return _oanda_account_id
-    if OANDA_ACCOUNT_ID:
-        _oanda_account_id = OANDA_ACCOUNT_ID
-        return _oanda_account_id
-
-    payload = await oanda_get(http, "/v3/accounts")
-    accounts = (payload or {}).get("accounts") or []
-    if not accounts:
-        logger.warning("OANDA returned no accounts for this token")
-        return None
-    _oanda_account_id = accounts[0].get("id")
-    if len(accounts) > 1:
-        logger.info(
-            "OANDA token has %d accounts, using %s (set OANDA_ACCOUNT_ID to pin one)",
-            len(accounts), _oanda_account_id,
-        )
+        base = compact[:-4]
+        candidates.append(compact)
+    elif compact.endswith("USDC"):
+        base = compact[:-4]
+        candidates.append(compact)
+    elif compact.endswith("USD"):
+        base = compact[:-3]
+        # BTCUSD -> BTCUSDT is the usual perpetual; the plain USD pair exists
+        # for a few inverse contracts, so keep it as a second choice.
+        candidates.extend([compact + "T", compact])
     else:
-        logger.info("OANDA account %s (%s)", _oanda_account_id, OANDA_HOST)
-    return _oanda_account_id
+        base = compact
+
+    candidates.extend([base + "USDT", base + "USDC"])
+    return [c for c in dict.fromkeys(candidates) if c]
 
 
-async def oanda_instruments(http: httpx.AsyncClient) -> set[str]:
-    """Instrument names this account can price, fetched once and cached."""
-    global _oanda_instruments
-    if _oanda_instruments is not None:
-        return _oanda_instruments
+async def bybit_symbols(http: httpx.AsyncClient, category: str) -> set[str]:
+    """Every pair Bybit lists in a category, cached for BYBIT_SYMBOLS_TTL."""
+    cached = _bybit_symbols.get(category)
+    if cached and time.monotonic() - _bybit_symbols_at.get(category, 0) < BYBIT_SYMBOLS_TTL:
+        return cached
 
-    account = await oanda_account_id(http)
-    if not account:
-        return set()
-    payload = await oanda_get(http, f"/v3/accounts/{account}/instruments")
-    if payload is None:
-        return set()  # transient: leave uncached so we retry next time
+    try:
+        response = await http.get(BYBIT_TICKERS_URL, params={"category": category})
+        payload = response.json()
+    except (httpx.HTTPError, ValueError) as error:
+        logger.warning("Could not fetch the Bybit %s pair list: %s", category, error)
+        return cached or set()
+
+    if payload.get("retCode") != 0:
+        logger.warning("Bybit %s pair list returned retCode %s",
+                       category, payload.get("retCode"))
+        return cached or set()
+
     names = {
-        item["name"] for item in payload.get("instruments") or [] if item.get("name")
+        row["symbol"]
+        for row in (payload.get("result") or {}).get("list") or []
+        if row.get("symbol")
     }
-    _oanda_instruments = names
-    logger.info("OANDA offers %d instruments on this account", len(names))
+    if not names:
+        return cached or set()
+
+    _bybit_symbols[category] = names
+    _bybit_symbols_at[category] = time.monotonic()
+    logger.info("Bybit lists %d %s pairs", len(names), category)
     return names
 
-
-async def oanda_prices(
-    http: httpx.AsyncClient, symbols: set[str]
-) -> dict[str, float]:
-    """Current mid prices for the given instruments: {name: price}.
-
-    Returns an empty dict on any failure — trades are simply skipped this
-    cycle rather than acting on a stale or missing quote.
-    """
-    if not symbols or not oanda_enabled():
-        return {}
-    account = await oanda_account_id(http)
-    if not account:
-        return {}
-
-    payload = await oanda_get(
-        http, f"/v3/accounts/{account}/pricing", instruments=",".join(sorted(symbols))
-    )
-    if payload is None:
-        return {}
-
-    prices = {}
-    for row in payload.get("prices") or []:
-        name = row.get("instrument")
-        price = oanda_price(row)
-        if name and price:
-            prices[name] = price
-    return prices
-
-
-# ---------------------------------------------------------------------------
-# Live prices, provider 2: Bybit public API (no key required)
-# ---------------------------------------------------------------------------
 
 async def fetch_bybit_price(
     http: httpx.AsyncClient, symbol: str, category: str
@@ -578,63 +465,38 @@ async def fetch_bybit_price(
         return None
 
 
-async def resolve_bybit_symbol(
-    http: httpx.AsyncClient, asset: str
-) -> Optional[tuple[str, str]]:
-    """Map an asset like BTCUSD to a Bybit (symbol, category), if it exists."""
-    compact = normalize_asset(asset)
-    if compact.endswith("USDT"):
-        candidates = [compact]
-    elif compact.endswith("USD"):
-        candidates = [compact + "T"]
-    else:
-        candidates = [compact + "USDT"]
-
-    for symbol in candidates:
-        for category in BYBIT_CATEGORIES:
-            if await fetch_bybit_price(http, symbol, category) is not None:
-                return symbol, category
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Provider routing: OANDA first (forex, metals, indices), Bybit for crypto
-# ---------------------------------------------------------------------------
-
 async def resolve_market(asset: str) -> Optional[dict]:
-    """Pick where to source live prices for an asset.
+    """Find the Bybit pair for a charted asset, or None if it isn't listed.
 
-    OANDA is preferred because it covers forex, metals and indices, which
-    Bybit does not list. Bybit is the fallback for crypto pairs (and for
-    everything, when no OANDA token is configured).
+    Bybit covers crypto and gold (XAUUSDT). Forex and stock indices are not
+    listed at all, so those charts get a signal but no live monitoring.
     """
-    async with httpx.AsyncClient(timeout=15) as http:
-        if oanda_enabled():
-            available = {name.upper(): name for name in await oanda_instruments(http)}
-            for candidate in oanda_symbol_candidates(asset):
-                symbol = available.get(candidate.upper())
-                if symbol:
-                    return {"provider": "oanda", "symbol": symbol}
-
-        resolved = await resolve_bybit_symbol(http, asset)
-        if resolved:
-            symbol, category = resolved
-            return {"provider": "bybit", "symbol": symbol, "category": category}
+    async with httpx.AsyncClient(timeout=20) as http:
+        listings = {
+            category: await bybit_symbols(http, category)
+            for category in BYBIT_CATEGORIES
+        }
+        for candidate in bybit_symbol_candidates(asset):
+            for category in BYBIT_CATEGORIES:
+                if candidate in listings[category]:
+                    return {
+                        "provider": "bybit",
+                        "symbol": candidate,
+                        "category": category,
+                    }
     return None
 
 
 async def fetch_trade_price(
-    http: httpx.AsyncClient, trade: dict, quotes: dict[str, float]
+    http: httpx.AsyncClient, trade: dict
 ) -> Optional[float]:
-    """Current price for a monitored trade, from whichever provider owns it.
+    """Current price for a monitored trade.
 
-    OANDA prices arrive pre-fetched for the whole cycle; Bybit is queried per
-    symbol. An unknown provider yields None, so the trade is skipped rather
-    than priced against the wrong market.
+    Trades registered by an older build against a provider that has since been
+    removed yield None, so they are skipped rather than priced against the
+    wrong market; the TTL retires them on its own.
     """
     provider = trade.get("provider", "bybit")
-    if provider == "oanda":
-        return quotes.get(trade["symbol"])
     if provider == "bybit":
         return await fetch_bybit_price(
             http, trade["symbol"], trade.get("category", "linear")
@@ -744,11 +606,6 @@ async def monitor_trades(context: ContextTypes.DEFAULT_TYPE) -> None:
     now = datetime.now(dt_timezone.utc)
 
     async with httpx.AsyncClient(timeout=15) as http:
-        # One OANDA request prices every OANDA-backed trade this cycle
-        quotes = await oanda_prices(
-            http, {t["symbol"] for t in trades if t.get("provider") == "oanda"}
-        )
-
         for trade in list(trades):
             decimals = trade.get("decimals", 2)
 
@@ -763,7 +620,7 @@ async def monitor_trades(context: ContextTypes.DEFAULT_TYPE) -> None:
                 )
                 continue
 
-            price = await fetch_trade_price(http, trade, quotes)
+            price = await fetch_trade_price(http, trade)
             if price is None:
                 continue
 
@@ -1062,16 +919,14 @@ async def handle_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
         await message.reply_text(build_signal_message(data))
 
-        # Register the trade for live monitoring (OANDA, or Bybit for crypto)
+        # Register the trade for live monitoring (Bybit pairs only)
         market = await resolve_market(data.asset)
         if not market:
-            hint = "" if oanda_enabled() else (
-                " Set OANDA_ACCESS_TOKEN to enable forex, metals and indices."
-            )
             await message.reply_text(
                 f"ℹ️ Live monitoring isn't available for {data.asset.upper()} "
-                f"(no matching instrument) — breakeven/TP/SL alerts are off "
-                f"for this trade.{hint}"
+                "— Bybit doesn't list a matching pair, so breakeven/TP/SL "
+                "alerts are off for this trade. (Bybit carries crypto and "
+                "gold; forex and stock indices aren't listed.)"
             )
             return
 
@@ -1200,11 +1055,7 @@ def main() -> None:
         MORNING_HOUR, NIGHT_HOUR, tz.key,
         datetime.now(tz).strftime("%Y-%m-%d %H:%M"),
     )
-    logger.info(
-        "Live prices: %s",
-        f"OANDA ({OANDA_HOST}) with Bybit fallback" if oanda_enabled()
-        else "Bybit only — set OANDA_ACCESS_TOKEN for forex/metals/indices",
-    )
+    logger.info("Live prices: Bybit public API (crypto and gold)")
 
     # On Render (and similar hosts) RENDER_EXTERNAL_URL is set automatically:
     # run in webhook mode so incoming Telegram messages wake the free service.
