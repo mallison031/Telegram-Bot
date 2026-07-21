@@ -468,7 +468,11 @@ def bybit_symbol_candidates(asset: str) -> list[str]:
 
 
 async def bybit_symbols(http: httpx.AsyncClient, category: str) -> set[str]:
-    """Every pair Bybit lists in a category, cached for BYBIT_SYMBOLS_TTL."""
+    """Every pair Bybit lists in a category, cached for BYBIT_SYMBOLS_TTL.
+
+    Diagnostics only — resolution probes individual symbols instead, because
+    this payload is ~550KB and too slow to sit on the request path.
+    """
     cached = _bybit_symbols.get(category)
     if cached and time.monotonic() - _bybit_symbols_at.get(category, 0) < BYBIT_SYMBOLS_TTL:
         return cached
@@ -682,13 +686,14 @@ async def resolve_market(asset: str) -> Optional[dict]:
     Twelve Data picks up forex, which Bybit does not list at all.
     """
     async with httpx.AsyncClient(timeout=20) as http:
-        listings = {
-            category: await bybit_symbols(http, category)
-            for category in BYBIT_CATEGORIES
-        }
+        # Ask Bybit about each candidate directly rather than downloading the
+        # whole ticker table. The full linear list is ~550KB and takes ~9s on
+        # a good connection, which times out on a free-tier host and silently
+        # rejects every asset; a single-symbol probe is ~1KB and answers in
+        # milliseconds. Bybit is still the authority on whether a pair exists.
         for candidate in bybit_symbol_candidates(asset):
             for category in BYBIT_CATEGORIES:
-                if candidate in listings[category]:
+                if await fetch_bybit_price(http, candidate, category) is not None:
                     return {
                         "provider": "bybit",
                         "symbol": candidate,
