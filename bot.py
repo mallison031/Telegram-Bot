@@ -11,10 +11,11 @@ trusting the AI with math), and replies with a formatted signal:
     Profit: +[X]% / Loss: -[Y]%
 
 Extra features:
-- Live trade monitoring (Bybit public API, no key): alerts when a pending
-  order fills, when to move SL to breakeven once price covers 30% of the
-  distance to TP, and a motivation message on TP or SL. Chart assets are
-  matched against Bybit's real pair list rather than a guessed suffix.
+- Live trade monitoring (Bybit for crypto and gold, Twelve Data for forex):
+  alerts when a pending order fills, when to move SL to breakeven once price
+  covers 30% of the distance to TP, and a motivation message on TP or SL.
+  Chart assets are matched against each provider's real instrument list
+  rather than a guessed suffix.
 - Morning and night motivation texts to every chat that has used the bot.
   Delivery is state-driven rather than a fixed timer, so a message missed
   while the host was asleep is still sent when the bot wakes up.
@@ -58,6 +59,14 @@ TIMEZONE = os.environ.get("TIMEZONE", "UTC")
 MORNING_HOUR = int(os.environ.get("MORNING_HOUR", "8"))
 NIGHT_HOUR = int(os.environ.get("NIGHT_HOUR", "22"))
 STATE_FILE = Path(os.environ.get("STATE_FILE", "state.json"))
+
+# Twelve Data supplies forex prices, which Bybit does not list. Get a free key
+# at https://twelvedata.com/. Without one, forex charts get a signal but no
+# live monitoring; crypto and gold are unaffected either way.
+TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY", "").strip()
+# Free tier allows 800 credits/day and one symbol costs one credit. Default
+# leaves headroom; polling is paced to fit whatever budget is set here.
+TWELVEDATA_DAILY_CREDITS = int(os.environ.get("TWELVEDATA_DAILY_CREDITS", "700"))
 
 # Fraction of the entry->TP distance that triggers the breakeven alert
 BREAKEVEN_FRACTION = 0.30
@@ -465,11 +474,164 @@ async def fetch_bybit_price(
         return None
 
 
-async def resolve_market(asset: str) -> Optional[dict]:
-    """Find the Bybit pair for a charted asset, or None if it isn't listed.
+# ---------------------------------------------------------------------------
+# Live prices: Twelve Data (forex — needs TWELVEDATA_API_KEY)
+#
+# Bybit lists no forex, so pairs like EURUSD come from Twelve Data instead.
+# Its free tier allows 800 credits/day and one symbol costs one credit, so
+# polling is paced to fit the daily budget rather than run at the 60s rate
+# used for crypto: with N forex trades open, a poll happens at most every
+# 86400 * N / TWELVEDATA_DAILY_CREDITS seconds. Between polls the previous
+# snapshot is reused, so alerts land up to that late — not never.
+# ---------------------------------------------------------------------------
 
-    Bybit covers crypto and gold (XAUUSDT). Forex and stock indices are not
-    listed at all, so those charts get a signal but no live monitoring.
+TWELVEDATA_BASE_URL = "https://api.twelvedata.com"
+# Reference data (the pair list) doesn't consume credits; cache it a day
+TWELVEDATA_PAIRS_TTL = 24 * 3600
+# Never poll faster than this even if the budget would allow it
+TWELVEDATA_MIN_INTERVAL = 120
+
+_td_pairs: Optional[set[str]] = None
+_td_pairs_at = 0.0
+_td_prices: dict[str, float] = {}
+_td_prices_at = 0.0
+
+
+def twelvedata_enabled() -> bool:
+    return bool(TWELVEDATA_API_KEY)
+
+
+def twelvedata_spacing(symbol_count: int) -> float:
+    """Minimum seconds between polls to stay inside the daily credit budget."""
+    if symbol_count <= 0 or TWELVEDATA_DAILY_CREDITS <= 0:
+        return TWELVEDATA_MIN_INTERVAL
+    return max(
+        TWELVEDATA_MIN_INTERVAL, 86400.0 * symbol_count / TWELVEDATA_DAILY_CREDITS
+    )
+
+
+def twelvedata_symbol_candidates(asset: str) -> list[str]:
+    """Twelve Data pair names to try for an asset like 'EURUSD'."""
+    compact = normalize_asset(asset)
+    candidates = []
+    if len(compact) == 6:
+        candidates.append(f"{compact[:3]}/{compact[3:]}")
+    candidates.append(compact)
+    return list(dict.fromkeys(candidates))
+
+
+def twelvedata_error(payload: dict) -> Optional[str]:
+    """The error message if this payload is an error envelope, else None."""
+    if isinstance(payload, dict) and payload.get("status") == "error":
+        return f"{payload.get('code')}: {payload.get('message')}"
+    return None
+
+
+async def twelvedata_get(
+    http: httpx.AsyncClient, path: str, **params
+) -> Optional[dict]:
+    """GET a Twelve Data endpoint, returning parsed JSON or None on failure."""
+    try:
+        response = await http.get(
+            f"{TWELVEDATA_BASE_URL}{path}",
+            params={**params, "apikey": TWELVEDATA_API_KEY},
+        )
+        payload = response.json()
+    except (httpx.HTTPError, ValueError) as error:
+        logger.warning("Twelve Data request to %s failed: %s", path, error)
+        return None
+
+    error = twelvedata_error(payload)
+    if error:
+        logger.warning("Twelve Data %s returned an error — %s", path, error)
+        return None
+    return payload
+
+
+async def twelvedata_pairs(http: httpx.AsyncClient) -> set[str]:
+    """Every forex pair Twelve Data lists, cached for TWELVEDATA_PAIRS_TTL."""
+    global _td_pairs, _td_pairs_at
+    if _td_pairs is not None and time.monotonic() - _td_pairs_at < TWELVEDATA_PAIRS_TTL:
+        return _td_pairs
+
+    payload = await twelvedata_get(http, "/forex_pairs")
+    if payload is None:
+        return _td_pairs or set()
+    names = {
+        row["symbol"] for row in payload.get("data") or [] if row.get("symbol")
+    }
+    if not names:
+        return _td_pairs or set()
+
+    _td_pairs, _td_pairs_at = names, time.monotonic()
+    logger.info("Twelve Data lists %d forex pairs", len(names))
+    return names
+
+
+def parse_twelvedata_prices(payload: dict, symbols: list[str]) -> dict[str, float]:
+    """Read prices from either response shape.
+
+    One symbol returns {"price": "1.08"}; several return a mapping keyed by
+    symbol, where an individual entry may itself be an error object.
+    """
+    def as_price(value) -> Optional[float]:
+        try:
+            price = float(value)
+        except (TypeError, ValueError):
+            return None
+        return price if price > 0 else None
+
+    if "price" in payload and len(symbols) == 1:
+        price = as_price(payload["price"])
+        return {symbols[0]: price} if price else {}
+
+    prices = {}
+    for symbol in symbols:
+        row = payload.get(symbol)
+        if not isinstance(row, dict):
+            continue
+        error = twelvedata_error(row)
+        if error:
+            logger.warning("Twelve Data has no price for %s — %s", symbol, error)
+            continue
+        price = as_price(row.get("price"))
+        if price:
+            prices[symbol] = price
+    return prices
+
+
+async def twelvedata_prices(
+    http: httpx.AsyncClient, symbols: set[str]
+) -> dict[str, float]:
+    """Current prices for the given pairs, paced to the free-tier budget."""
+    global _td_prices, _td_prices_at
+    if not symbols or not twelvedata_enabled():
+        return {}
+
+    spacing = twelvedata_spacing(len(symbols))
+    if _td_prices_at and time.monotonic() - _td_prices_at < spacing:
+        return _td_prices  # too soon to spend more credits; reuse the snapshot
+
+    ordered = sorted(symbols)
+    payload = await twelvedata_get(http, "/price", symbol=",".join(ordered))
+    if payload is None:
+        return _td_prices  # keep serving the last good snapshot
+
+    prices = parse_twelvedata_prices(payload, ordered)
+    if prices:
+        _td_prices, _td_prices_at = prices, time.monotonic()
+    return prices or _td_prices
+
+
+# ---------------------------------------------------------------------------
+# Provider routing: Bybit for crypto and gold, Twelve Data for forex
+# ---------------------------------------------------------------------------
+
+async def resolve_market(asset: str) -> Optional[dict]:
+    """Pick where to source live prices for a charted asset.
+
+    Bybit goes first: it is keyless, unmetered and covers crypto plus gold.
+    Twelve Data picks up forex, which Bybit does not list at all.
     """
     async with httpx.AsyncClient(timeout=20) as http:
         listings = {
@@ -484,23 +646,32 @@ async def resolve_market(asset: str) -> Optional[dict]:
                         "symbol": candidate,
                         "category": category,
                     }
+
+        if twelvedata_enabled():
+            pairs = await twelvedata_pairs(http)
+            for candidate in twelvedata_symbol_candidates(asset):
+                if candidate in pairs:
+                    return {"provider": "twelvedata", "symbol": candidate}
     return None
 
 
 async def fetch_trade_price(
-    http: httpx.AsyncClient, trade: dict
+    http: httpx.AsyncClient, trade: dict, quotes: dict[str, float]
 ) -> Optional[float]:
     """Current price for a monitored trade.
 
-    Trades registered by an older build against a provider that has since been
-    removed yield None, so they are skipped rather than priced against the
-    wrong market; the TTL retires them on its own.
+    Twelve Data prices arrive pre-fetched for the whole cycle; Bybit is
+    queried per symbol. Trades registered against a provider that has since
+    been removed yield None, so they are skipped rather than priced against
+    the wrong market, and the TTL retires them on its own.
     """
     provider = trade.get("provider", "bybit")
     if provider == "bybit":
         return await fetch_bybit_price(
             http, trade["symbol"], trade.get("category", "linear")
         )
+    if provider == "twelvedata":
+        return quotes.get(trade["symbol"])
     logger.warning(
         "Trade on %s uses retired provider %r — it will expire on its own",
         trade.get("asset"), provider,
@@ -606,6 +777,11 @@ async def monitor_trades(context: ContextTypes.DEFAULT_TYPE) -> None:
     now = datetime.now(dt_timezone.utc)
 
     async with httpx.AsyncClient(timeout=15) as http:
+        # One Twelve Data request covers every forex trade this cycle
+        quotes = await twelvedata_prices(
+            http, {t["symbol"] for t in trades if t.get("provider") == "twelvedata"}
+        )
+
         for trade in list(trades):
             decimals = trade.get("decimals", 2)
 
@@ -620,7 +796,7 @@ async def monitor_trades(context: ContextTypes.DEFAULT_TYPE) -> None:
                 )
                 continue
 
-            price = await fetch_trade_price(http, trade)
+            price = await fetch_trade_price(http, trade, quotes)
             if price is None:
                 continue
 
@@ -919,14 +1095,16 @@ async def handle_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
         await message.reply_text(build_signal_message(data))
 
-        # Register the trade for live monitoring (Bybit pairs only)
+        # Register the trade for live monitoring (Bybit, or Twelve Data for forex)
         market = await resolve_market(data.asset)
         if not market:
+            hint = "" if twelvedata_enabled() else (
+                " Set TWELVEDATA_API_KEY to enable forex monitoring."
+            )
             await message.reply_text(
                 f"ℹ️ Live monitoring isn't available for {data.asset.upper()} "
-                "— Bybit doesn't list a matching pair, so breakeven/TP/SL "
-                "alerts are off for this trade. (Bybit carries crypto and "
-                "gold; forex and stock indices aren't listed.)"
+                f"— no price feed lists it, so breakeven/TP/SL alerts are off "
+                f"for this trade.{hint}"
             )
             return
 
@@ -968,6 +1146,19 @@ async def handle_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         })
         save_state()
 
+        # Forex is polled on a free data plan, so be honest about the cadence
+        cadence = ""
+        if market["provider"] == "twelvedata":
+            open_pairs = {
+                t["symbol"] for t in state["trades"]
+                if t.get("provider") == "twelvedata"
+            }
+            minutes = twelvedata_spacing(len(open_pairs)) / 60
+            cadence = (
+                f"\n⏱ Forex prices are checked about every {minutes:.0f} min "
+                "(free data plan), so alerts can be that late."
+            )
+
         if fill:
             expiry = (
                 f"\nMonitoring stops automatically after {TRADE_TTL_HOURS:g}h."
@@ -977,14 +1168,14 @@ async def handle_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 f"🔔 Pending order registered. I'll tell you when price "
                 f"reaches your entry at {data.entry:.{decimals}f}, then watch "
                 f"for breakeven ({be_price:.{decimals}f}), TP and SL."
-                f"{expiry}"
+                f"{expiry}{cadence}"
             )
         else:
             await message.reply_text(
                 f"🔔 Trade is being monitored live.\n"
                 f"I'll alert you to move SL to breakeven at "
                 f"{be_price:.{decimals}f} (30% of the way to TP), and again "
-                f"when TP or SL is hit."
+                f"when TP or SL is hit.{cadence}"
             )
     except Exception:
         logger.exception("Failed to process chart")
@@ -1055,7 +1246,12 @@ def main() -> None:
         MORNING_HOUR, NIGHT_HOUR, tz.key,
         datetime.now(tz).strftime("%Y-%m-%d %H:%M"),
     )
-    logger.info("Live prices: Bybit public API (crypto and gold)")
+    logger.info(
+        "Live prices: Bybit (crypto, gold) + %s",
+        f"Twelve Data (forex, {TWELVEDATA_DAILY_CREDITS} credits/day)"
+        if twelvedata_enabled()
+        else "no forex feed — set TWELVEDATA_API_KEY to enable it",
+    )
 
     # On Render (and similar hosts) RENDER_EXTERNAL_URL is set automatically:
     # run in webhook mode so incoming Telegram messages wake the free service.

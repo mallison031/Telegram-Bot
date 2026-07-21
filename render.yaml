@@ -13,3 +13,8 @@ services:
       # Set this — it defaults to UTC, which shifts the morning/night texts
       - key: TIMEZONE
         sync: false
+      # Optional: enables forex monitoring (crypto and gold need no key).
+      # `key` is the variable NAME; sync:false means Render prompts you for
+      # the value. Never put the actual token in this file — it is committed.
+      - key: TWELVEDATA_API_KEY
+        sync: false

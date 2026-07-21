@@ -109,13 +109,39 @@ The command menu is registered with Telegram automatically at startup.
 
 | Instruments | Provider | Needs |
 | --- | --- | --- |
-| Crypto (BTCUSD, ETHUSD, SOLUSD…) | ✅ monitored | `BTCUSDT` etc. |
-| Gold and silver (XAUUSD, XAGUSD) | ✅ monitored | `XAUUSDT`, `XAGUSDT` |
-| Forex (EURUSD, GBPUSD…), stock indices, oil | ❌ not monitored | not listed on Bybit |
+| Instruments | Provider | Update rate | Needs |
+| --- | --- | --- | --- |
+| Crypto (BTCUSD, ETHUSD, SOLUSD…) | Bybit | every 60 s | nothing |
+| Gold and silver (XAUUSD, XAGUSD) | Bybit | every 60 s | nothing |
+| Forex (EURUSD, GBPUSD, USDJPY…) | Twelve Data | every 2–6 min | `TWELVEDATA_API_KEY` |
+| Stock indices, oil | — | not monitored | — |
 
-Prices come from Bybit's public API — no key, no account, no rate-limit
-worries. Charts Bybit doesn't list still get a signal; they just don't get
-breakeven/TP/SL alerts.
+The two providers are used together, each for what it does best. Bybit is
+keyless and unmetered, so it handles everything it lists — all crypto plus
+gold and silver. Twelve Data fills the one gap that matters, forex, which
+Bybit does not list at all. Charts neither provider carries still get a
+signal; they just don't get breakeven/TP/SL alerts.
+
+#### Forex polling and the free credit budget
+
+Twelve Data's free tier allows **800 credits/day**, and one pair costs one
+credit per poll. Polling at the crypto rate of once a minute would burn that
+in under an hour, so forex is paced to fit the budget instead:
+
+| Open forex trades | Price check every |
+| --- | --- |
+| 1 | ~2 min |
+| 2 | ~4 min |
+| 3 | ~6 min |
+
+Crypto and gold are unaffected — they still update every 60 seconds. The
+practical cost is that a forex breakeven/TP/SL alert can arrive a few minutes
+after the level is touched, which the bot tells you when it registers the
+trade. Set `TWELVEDATA_DAILY_CREDITS` lower to be more conservative, or higher
+if you upgrade the plan.
+
+If the credit budget does run out, the bot keeps serving the last known prices
+and logs the error rather than crashing or going silent.
 
 #### How a chart maps to a Bybit pair
 
@@ -136,7 +162,14 @@ ticker prefix.
 > instruments across the linear, inverse and spot categories returns only
 > `XAUUSDT` and `XAGUSDT` as non-crypto. MT5 is reachable only through the
 > MetaTrader terminal, whose Python bridge is Windows-only and cannot run on
-> Render.
+> Render. Forex therefore comes from Twelve Data instead.
+
+#### Getting a Twelve Data key
+
+Sign up free at [twelvedata.com](https://twelvedata.com/) — no card — and copy
+the API key from the dashboard. Put it in `.env` as `TWELVEDATA_API_KEY=…` and
+in Render's environment variables. Without it, crypto and gold monitoring work
+exactly as before and forex charts simply get a signal with no alerts.
 
 ## How it works
 
@@ -303,11 +336,15 @@ service uses ~730 of the free plan's 750 instance-hours per month, so it fits.
    `state.json`. That list is lost when the free-tier filesystem resets;
    sending any message to the bot re-registers the chat.
 
-**A trade says monitoring is unavailable.** Bybit doesn't list a pair for that
-asset. Expected for forex and stock indices — see the coverage table above.
-For a crypto pair you believe exists, check the startup log for
-`Bybit lists N linear pairs`; if that line is missing or N is 0, the pair
-list couldn't be downloaded and every asset will be rejected.
+**A trade says monitoring is unavailable.** Neither provider lists that asset.
+Expected for stock indices and oil — see the coverage table above. For forex,
+check that `TWELVEDATA_API_KEY` is set; the startup log line beginning
+`Live prices:` says whether the forex feed is active. For a crypto pair you
+believe exists, look for `Bybit lists N linear pairs`; if that line is missing
+or N is 0, the pair list couldn't be downloaded and every asset is rejected.
+
+**Forex alerts feel slow.** That's the free data plan — see the polling table
+above. Crypto and gold still update every 60 s.
 
 ### Updating the bot
 
