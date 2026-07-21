@@ -93,11 +93,15 @@ BYBIT_CATEGORIES = ("linear", "spot")
 
 # Tried in order — first one that responds wins. The newest Flash models on the
 # free tier intermittently return 503 (high demand), so we keep fallbacks.
-# Order is by observed availability, not preference: on the free tier the
-# first two have been serving steady 503s while the third answers, and every
-# dead model tried first adds ~8s to the user's wait. All three stay in the
-# list so the bot rides out whichever one is busy on a given day.
+# Ordered by measured availability and latency on the free tier, not by
+# version number. Benchmarked with a real vision+schema call: 3.6-flash
+# answered in 2.7s and 3.1-flash-lite in 1.1s, while 3-flash-preview took
+# 29.8s and the rest returned 429 (quota exhausted) inside a second.
+# Exhausted models fail fast, so they cost almost nothing to skip and stay on
+# as fallbacks for when the quota window rolls over.
 GEMINI_MODELS = [
+    "gemini-3.6-flash",
+    "gemini-3.1-flash-lite",
     "gemini-3-flash-preview",
     "gemini-flash-latest",
     "gemini-3.5-flash",
