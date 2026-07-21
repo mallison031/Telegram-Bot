@@ -10,3 +10,9 @@ services:
         sync: false
       - key: GEMINI_API_KEY
         sync: false
+      # Set this — it defaults to UTC, which shifts the morning/night texts
+      - key: TIMEZONE
+        sync: false
+      # Optional: enables forex/metals/indices monitoring via FXCM
+      - key: FXCM_ACCESS_TOKEN
+        sync: false

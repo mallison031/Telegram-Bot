@@ -74,26 +74,64 @@ drawn on it — you'll get the formatted signal back in a few seconds.
 ## Features
 
 - **Chart signals** — send a chart screenshot, get the formatted signal back.
-- **Breakeven alert** — after a signal, the bot watches the live price
-  (Bybit public API) and messages you to move SL to breakeven once price
-  covers **30% of the distance from entry to TP**.
+- **Pending orders are tracked as pending** — a `LIMIT`/`STOP` setup isn't a
+  position yet, so the bot stays quiet about breakeven/TP/SL until price
+  actually touches your entry, then messages you that the order should be
+  filled. If price runs to TP without ever filling, it tells you the setup
+  played out without you instead of claiming a win you never took.
+- **Breakeven alert** — once the trade is live, the bot watches the price
+  (FXCM, or Bybit for crypto) and messages you to move SL to breakeven once
+  price covers **30% of the distance from entry to TP**.
 - **TP/SL result messages** — when the trade hits take profit or stop loss,
   the bot sends a motivation message (and stops monitoring that trade).
-- **Morning motivation** — a fresh Gemini-written motivation text every day
-  at `MORNING_HOUR` (default 8:00, timezone via `TIMEZONE` env var) to every
-  chat that has used the bot.
+- **No duplicates, no stale trades** — re-sending the same chart won't
+  register the trade twice, and monitoring stops on its own after
+  `TRADE_TTL_HOURS` (default 72) if nothing has resolved.
+- **Morning and night motivation** — a fresh Gemini-written text each day at
+  `MORNING_HOUR` (default 8:00) and `NIGHT_HOUR` (default 22:00), in
+  `TIMEZONE`, to every chat that has used the bot. The morning text is a
+  plan-your-day nudge; the night one is a wind-down (journal your trades, no
+  revenge trading, rest).
 
-> Live monitoring works for assets with a matching Bybit pair — all major
-> crypto (BTCUSD, ETHUSD, ...) and gold (XAUUSD via the XAUUSDT perpetual).
-> Forex pairs like EURUSD aren't listed on Bybit; for those the bot says
-> monitoring is unavailable and still sends the signal.
+### Commands
+
+| Command | What it does |
+| --- | --- |
+| `/start` | Usage hint |
+| `/trades` | List the trades being monitored in this chat, with status |
+| `/cancel [n\|all]` | Stop monitoring one trade (or all of them) |
+| `/motivate` | Send the morning text right now (handy for testing) |
+| `/night` | Send the night text right now |
+
+The command menu is registered with Telegram automatically at startup.
+
+### Which assets can be monitored
+
+| Instruments | Provider | Needs |
+| --- | --- | --- |
+| Forex (EURUSD…), metals (XAUUSD), indices (US30, NAS100), oil | FXCM | `FXCM_ACCESS_TOKEN` |
+| Crypto (BTCUSD, ETHUSD…) | Bybit | nothing — public API |
+
+FXCM is tried first and covers everything a retail forex chart is likely to
+show; Bybit picks up crypto, which FXCM does not carry on every entity. If
+neither lists the instrument, the bot still sends the signal and just says
+monitoring is off for that trade.
+
+> **Without `FXCM_ACCESS_TOKEN` only crypto is monitored.** Generate a token at
+> [tradingstation.fxcm.com](https://tradingstation.fxcm.com/) → *User Account*
+> → *Token Management*, put it in `.env` (and in Render's env vars), and set
+> `FXCM_SERVER=demo` or `real` to match the account it came from. An FXCM demo
+> account is free and its token works for prices.
+>
+> FXCM only quotes instruments your account is subscribed to — if a pair you
+> trade shows as unavailable, add it to the market watch in Trading Station.
 
 ## How it works
 
-- **The bot responds to chart images only.** Text messages get no reply, and
-  images that aren't a trading chart with a position tool are silently ignored
-  (Gemini classifies each image before extraction). `/start` shows a short
-  usage hint.
+- **The bot responds to chart images and its own commands only.** Text
+  messages get no reply, and images that aren't a trading chart with a
+  position tool are silently ignored (Gemini classifies each image before
+  extraction).
 - `bot.py` polls Telegram for messages. Photos (and image files) are downloaded
   and sent to **Gemini Flash** with a prompt describing how to read a
   TradingView-style position tool (red box = stop loss, green/blue box = take
@@ -107,6 +145,21 @@ drawn on it — you'll get the formatted signal back in a few seconds.
 - The backend **calculates the percentages deterministically** (per the roadmap
   formulas), deduces the order type (LIMIT/STOP) by comparing entry to the
   current price, validates that the setup is coherent, and formats the reply.
+- That same entry-vs-current-price comparison decides whether the trade starts
+  out **pending** or **live**: a market order is live immediately, while a
+  LIMIT/STOP order waits for price to reach entry before any breakeven/TP/SL
+  alert can fire. Every 60 s a background job checks each monitored trade
+  against the live price and advances it through those states.
+- **FXCM prices** need a `Bearer <socket_id><token>` header, where `socket_id`
+  comes from a socket.io handshake. The bot performs that handshake once,
+  caches the session, and re-establishes it automatically if FXCM expires it.
+  A single `get_model` call returns every instrument, so one request per cycle
+  covers all open trades no matter how many there are.
+- **The scheduled texts are state-driven, not timer-driven.** The bot records
+  the date each text was last sent in `state.json` and checks every 5 minutes
+  whether today's is still outstanding. A one-shot daily timer is silently
+  dropped if the host happens to be asleep at that exact minute — this
+  survives that, and delivers the message late (up to 6 h) instead of never.
 
 ## How the Telegram side works
 
@@ -189,13 +242,15 @@ The bot has two modes, picked automatically:
    - Or manually: **New → Web Service**, pick the repo, runtime *Python*,
      build command `pip install -r requirements.txt`, start command
      `python bot.py`, instance type **Free**.
-3. When prompted, set the two environment variables:
-   - `TELEGRAM_BOT_TOKEN`
-   - `GEMINI_API_KEY`
+3. When prompted, set the environment variables:
+   - `TELEGRAM_BOT_TOKEN`, `GEMINI_API_KEY` — required
+   - `TIMEZONE` — set it (e.g. `Africa/Lagos`), or the scheduled texts run on
+     UTC and arrive at the wrong local hour
+   - `FXCM_ACCESS_TOKEN` — optional, enables forex/metals/indices monitoring
 4. Deploy. Once live, the bot registers its own webhook with Telegram —
    no manual webhook setup needed. Send `/start` to the bot to confirm.
 
-### Keep the service awake (required for monitoring & morning texts)
+### Keep the service awake (required for monitoring & scheduled texts)
 
 A sleeping service can't watch live prices or send scheduled messages, so set
 up a free uptime pinger to keep it awake 24/7:
@@ -208,10 +263,38 @@ up a free uptime pinger to keep it awake 24/7:
 That's it — the pings stop Render from ever idling the service. One always-on
 service uses ~730 of the free plan's 750 instance-hours per month, so it fits.
 
-> Note: active trades and the subscriber list are stored in a local
-> `state.json`. On Render's free tier this file is wiped on every redeploy or
-> restart — monitored trades are forgotten then (re-send the chart to
-> re-register). Fine for personal use.
+> Note: monitored trades, the subscriber list and the record of which texts
+> have already gone out are stored in a local `state.json` (gitignored — it
+> holds your chat IDs and open positions, so don't commit it). On Render's
+> free tier this file is wiped on every redeploy or restart: monitored trades
+> are forgotten (re-send the chart to re-register), and a redeploy shortly
+> after a scheduled text can send it a second time. To make it survive, attach
+> a Render persistent disk and point `STATE_FILE` at a path on it.
+
+## Troubleshooting
+
+**The morning or night text didn't arrive.** Check, in order:
+
+1. **Send `/motivate`.** If a message comes back, Gemini and delivery are fine
+   and the problem is timing, not the bot. If nothing comes back, check the
+   logs — Gemini failures fall back to a canned message, so silence points at
+   Telegram delivery or the chat not being registered (send `/start`).
+2. **Is `TIMEZONE` set on the host?** Unset means UTC — an 8:00 text lands at
+   9:00 in Lagos, 4:00 in New York. The startup log prints the resolved
+   timezone and the local time, e.g.
+   `Motivation texts: morning 08:00, night 22:00 (Africa/Lagos, now ...)`.
+3. **Was the service awake?** A sleeping free-tier service runs no jobs at all.
+   The bot now catches up on a text it missed while asleep (up to 6 hours
+   late), but it can only do that once it wakes — set up the uptime pinger
+   above.
+4. **Did the chat ever `/start` the bot?** Scheduled texts only go to chats in
+   `state.json`. That list is lost when the free-tier filesystem resets;
+   sending any message to the bot re-registers the chat.
+
+**A trade says monitoring is unavailable.** The instrument wasn't found at
+either provider. Forex, metals and indices need `FXCM_ACCESS_TOKEN`; check the
+startup log line beginning `Live prices:` to see whether FXCM is active, and
+confirm the pair is in your Trading Station market watch.
 
 ### Updating the bot
 

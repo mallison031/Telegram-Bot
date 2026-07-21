@@ -11,10 +11,12 @@ trusting the AI with math), and replies with a formatted signal:
     Profit: +[X]% / Loss: -[Y]%
 
 Extra features:
-- Live trade monitoring (Bybit public API): alerts to move SL to breakeven
-  once price covers 30% of the distance to TP, and sends a motivation message
-  when TP or SL is hit.
-- Daily morning motivation text to every chat that has used the bot.
+- Live trade monitoring (FXCM REST API, with Bybit as a crypto fallback):
+  alerts when a pending order fills, when to move SL to breakeven once price
+  covers 30% of the distance to TP, and a motivation message on TP or SL.
+- Morning and night motivation texts to every chat that has used the bot.
+  Delivery is state-driven rather than a fixed timer, so a message missed
+  while the host was asleep is still sent when the bot wakes up.
 """
 
 import asyncio
@@ -22,12 +24,14 @@ import json
 import logging
 import os
 import random
-from datetime import time as dtime
+import re
+from datetime import datetime, timedelta
+from datetime import timezone as dt_timezone
 from pathlib import Path
 from typing import Literal, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
-import pytz
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types as genai_types
@@ -50,12 +54,34 @@ GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 # Optional settings
 TIMEZONE = os.environ.get("TIMEZONE", "UTC")
 MORNING_HOUR = int(os.environ.get("MORNING_HOUR", "8"))
+NIGHT_HOUR = int(os.environ.get("NIGHT_HOUR", "22"))
 STATE_FILE = Path(os.environ.get("STATE_FILE", "state.json"))
+
+# FXCM credentials. Generate a token in Trading Station Web -> User Account ->
+# Token Management. Without a token FXCM is skipped and Bybit is used alone.
+FXCM_ACCESS_TOKEN = os.environ.get("FXCM_ACCESS_TOKEN", "").strip()
+FXCM_SERVER = os.environ.get("FXCM_SERVER", "demo").strip().lower()
 
 # Fraction of the entry->TP distance that triggers the breakeven alert
 BREAKEVEN_FRACTION = 0.30
 # How often to check live prices for active trades (seconds)
 MONITOR_INTERVAL = 60
+# Drop a monitored trade after this many hours so stale setups don't pile up
+# (0 disables expiry)
+TRADE_TTL_HOURS = float(os.environ.get("TRADE_TTL_HOURS", "72"))
+# Entry within this fraction of the current price counts as a market order
+MARKET_ORDER_TOLERANCE = 0.0005
+# Relative tolerance for treating a re-sent chart as the same trade
+DUPLICATE_TOLERANCE = 0.001
+
+# How often to check whether a scheduled text is due (seconds)
+SCHEDULE_INTERVAL = 300
+# A scheduled text more than this many hours late is dropped rather than sent
+# at a nonsensical time (e.g. the morning text arriving at 6pm).
+CATCHUP_HOURS = 6
+
+FXCM_HOST = "api-demo.fxcm.com" if FXCM_SERVER == "demo" else "api.fxcm.com"
+FXCM_BASE_URL = f"https://{FXCM_HOST}:443"
 
 BYBIT_TICKERS_URL = "https://api.bybit.com/v5/market/tickers"
 # Bybit market categories to search for a pair, in order of preference:
@@ -84,13 +110,36 @@ gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 # Persistent state: subscribed chats + active trades
 # ---------------------------------------------------------------------------
 
+def utcnow_iso() -> str:
+    return datetime.now(dt_timezone.utc).isoformat()
+
+
+def local_timezone() -> ZoneInfo:
+    try:
+        return ZoneInfo(TIMEZONE)
+    except (ZoneInfoNotFoundError, ValueError):
+        logger.warning("Unknown TIMEZONE %r, falling back to UTC", TIMEZONE)
+        return ZoneInfo("UTC")
+
+
 def load_state() -> dict:
+    data: dict = {}
     if STATE_FILE.exists():
         try:
-            return json.loads(STATE_FILE.read_text())
+            data = json.loads(STATE_FILE.read_text())
         except (json.JSONDecodeError, OSError):
             logger.warning("Could not read %s, starting fresh", STATE_FILE)
-    return {"chats": [], "trades": []}
+    data.setdefault("chats", [])
+    data.setdefault("trades", [])
+    # Date (YYYY-MM-DD, local) each scheduled text was last delivered
+    data.setdefault("last_sent", {})
+    # Migrate trades written by older versions, which lacked these fields
+    now = utcnow_iso()
+    for trade in data["trades"]:
+        trade.setdefault("status", "active")
+        trade.setdefault("created_at", now)
+        trade.setdefault("provider", "bybit")
+    return data
 
 
 def save_state() -> None:
@@ -240,23 +289,33 @@ def breakeven_price(data: TradeData) -> float:
     return data.entry + (data.take_profit - data.entry) * BREAKEVEN_FRACTION
 
 
+def entry_fill_direction(data: TradeData) -> Optional[str]:
+    """Which way price must travel to reach entry: 'up', 'down', or None.
+
+    None means the order fills immediately at market — either entry is already
+    at the current price, or the chart gave us no current price to compare to.
+    """
+    current = data.current_price
+    if current is None or current <= 0:
+        return None
+    if abs(data.entry - current) / data.entry < MARKET_ORDER_TOLERANCE:
+        return None
+    return "up" if data.entry > current else "down"
+
+
 def determine_order_type(data: TradeData) -> str:
     """Deduce the pending-order type by comparing entry to current price."""
     action = "SELL" if data.direction == "SHORT" else "BUY"
-    current = data.current_price
-    if current is None or current <= 0:
-        return action
-
-    # Within 0.05% of entry -> effectively a market order
-    if abs(data.entry - current) / data.entry < 0.0005:
+    fill = entry_fill_direction(data)
+    if fill is None:
         return action
 
     if data.direction == "SHORT":
         # Selling above the market waits for price to rise -> LIMIT
-        order = "LIMIT" if data.entry > current else "STOP"
+        order = "LIMIT" if fill == "up" else "STOP"
     else:
         # Buying below the market waits for price to fall -> LIMIT
-        order = "LIMIT" if data.entry < current else "STOP"
+        order = "LIMIT" if fill == "down" else "STOP"
     return f"{action} {order}"
 
 
@@ -308,7 +367,178 @@ def validate(data: TradeData) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Live price monitoring (Bybit public API — no key required)
+# Live prices, provider 1: FXCM REST API (needs FXCM_ACCESS_TOKEN)
+#
+# FXCM authenticates with "Bearer <socket_id><token>", where socket_id comes
+# from a socket.io handshake. We only need snapshots, so instead of holding a
+# streaming connection we do the polling handshake once, cache the id, and
+# reuse it until the API rejects it. One get_model call returns every
+# instrument, so a monitoring cycle costs a single request no matter how many
+# trades are open.
+# ---------------------------------------------------------------------------
+
+# FXCM names instruments "EUR/USD", "XAU/USD", "SPX500", "USOil". Anything not
+# listed here is handled by the generic 6-letter -> "XXX/YYY" rule.
+FXCM_ALIASES = {
+    "XAUUSD": "XAU/USD", "GOLD": "XAU/USD",
+    "XAGUSD": "XAG/USD", "SILVER": "XAG/USD",
+    "USOIL": "USOil", "WTI": "USOil", "UKOIL": "UKOil", "BRENT": "UKOil",
+    "SPX500": "SPX500", "US500": "SPX500", "SP500": "SPX500",
+    "NAS100": "NAS100", "USTEC": "NAS100", "NASDAQ": "NAS100",
+    "US30": "US30", "DJI": "US30", "DOW": "US30",
+    "GER30": "GER30", "DAX": "GER30", "GER40": "GER30",
+    "UK100": "UK100", "FTSE": "UK100", "JPN225": "JPN225", "NIKKEI": "JPN225",
+}
+
+_fxcm_socket_id: Optional[str] = None
+# FXCM's own docs disagree on whether the bearer has a space between the socket
+# id and the token, so we learn which form this server accepts and keep it.
+# Once a request has succeeded the separator is settled and never flipped
+# again — after that a 401 means the session expired, not a bad header.
+_fxcm_bearer_sep = ""
+_fxcm_bearer_confirmed = False
+
+
+def fxcm_enabled() -> bool:
+    return bool(FXCM_ACCESS_TOKEN)
+
+
+def normalize_asset(asset: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", asset.upper())
+
+
+def fxcm_symbol_candidates(asset: str) -> list[str]:
+    """FXCM instrument names to try for an asset like 'EURUSD' or 'XAUUSD'."""
+    compact = normalize_asset(asset)
+    candidates = []
+    if compact in FXCM_ALIASES:
+        candidates.append(FXCM_ALIASES[compact])
+    # Crypto charts often read as USDT pairs; FXCM quotes them against USD
+    if compact.endswith("USDT"):
+        compact = compact[:-1]
+    if len(compact) == 6:
+        candidates.append(f"{compact[:3]}/{compact[3:]}")
+    candidates.append(compact)
+    return list(dict.fromkeys(candidates))
+
+
+def offer_price(offer: dict) -> Optional[float]:
+    """Mid price from an FXCM offer row, tolerating either field naming."""
+    for bid_key, ask_key in (("sell", "buy"), ("rateBid", "rateAsk")):
+        try:
+            bid = float(offer[bid_key])
+            ask = float(offer[ask_key])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if bid > 0 and ask > 0:
+            return (bid + ask) / 2
+    return None
+
+
+async def fxcm_handshake(http: httpx.AsyncClient) -> Optional[str]:
+    """Open a socket.io polling handshake and return the session id."""
+    global _fxcm_socket_id
+    if _fxcm_socket_id:
+        return _fxcm_socket_id
+    try:
+        response = await http.get(
+            f"{FXCM_BASE_URL}/socket.io/",
+            params={
+                "access_token": FXCM_ACCESS_TOKEN,
+                "EIO": "3",
+                "transport": "polling",
+            },
+        )
+    except httpx.HTTPError as error:
+        logger.warning("FXCM handshake failed: %s", error)
+        return None
+    if response.status_code != 200:
+        logger.warning(
+            "FXCM handshake rejected (HTTP %s) — check FXCM_ACCESS_TOKEN "
+            "and FXCM_SERVER (%s)", response.status_code, FXCM_SERVER
+        )
+        return None
+    # engine.io replies with a length-prefixed frame: 97:0{"sid":"...",...}
+    match = re.search(r'"sid"\s*:\s*"([^"]+)"', response.text)
+    if not match:
+        logger.warning("FXCM handshake returned no session id")
+        return None
+    _fxcm_socket_id = match.group(1)
+    logger.info("FXCM session established (%s)", FXCM_HOST)
+    return _fxcm_socket_id
+
+
+def fxcm_headers(socket_id: str) -> dict:
+    return {
+        "User-Agent": "trading-chart-bot",
+        "Accept": "application/json",
+        "Authorization": f"Bearer {socket_id}{_fxcm_bearer_sep}{FXCM_ACCESS_TOKEN}",
+    }
+
+
+async def fxcm_offers(http: httpx.AsyncClient) -> dict[str, float]:
+    """Snapshot of every instrument FXCM is quoting: {symbol: mid price}.
+
+    Returns an empty dict on any failure — callers fall back to Bybit.
+    """
+    global _fxcm_socket_id, _fxcm_bearer_sep, _fxcm_bearer_confirmed
+    if not fxcm_enabled():
+        return {}
+
+    attempts = 3
+    for attempt in range(attempts):
+        socket_id = await fxcm_handshake(http)
+        if not socket_id:
+            return {}
+        try:
+            response = await http.get(
+                f"{FXCM_BASE_URL}/trading/get_model",
+                params={"models": "Offer"},
+                headers=fxcm_headers(socket_id),
+            )
+        except httpx.HTTPError as error:
+            logger.warning("FXCM get_model failed: %s", error)
+            return {}
+
+        if response.status_code in (401, 403):
+            # The session id may have expired — always drop it. Only flip the
+            # header format while it is still unproven; flipping a separator
+            # that has already worked would break a good session refresh.
+            _fxcm_socket_id = None
+            if not _fxcm_bearer_confirmed:
+                _fxcm_bearer_sep = " " if _fxcm_bearer_sep == "" else ""
+            if attempt < attempts - 1:
+                continue
+            logger.warning(
+                "FXCM rejected our credentials (HTTP %s) — check "
+                "FXCM_ACCESS_TOKEN and FXCM_SERVER (%s)",
+                response.status_code, FXCM_SERVER,
+            )
+            return {}
+
+        _fxcm_bearer_confirmed = True
+        try:
+            payload = response.json()
+        except ValueError:
+            logger.warning("FXCM returned a non-JSON response")
+            return {}
+
+        offers = payload.get("offers") or []
+        prices = {}
+        for offer in offers:
+            symbol = offer.get("currency")
+            price = offer_price(offer)
+            if symbol and price:
+                prices[symbol] = price
+        if not prices:
+            logger.warning("FXCM offer table was empty — subscribe the "
+                           "instruments you trade in Trading Station")
+        return prices
+    return {}
+
+
+# ---------------------------------------------------------------------------
+# Live prices, provider 2: Bybit public API (no key required)
 # ---------------------------------------------------------------------------
 
 async def fetch_bybit_price(
@@ -334,9 +564,11 @@ async def fetch_bybit_price(
         return None
 
 
-async def resolve_bybit_symbol(asset: str) -> Optional[tuple[str, str]]:
+async def resolve_bybit_symbol(
+    http: httpx.AsyncClient, asset: str
+) -> Optional[tuple[str, str]]:
     """Map an asset like BTCUSD to a Bybit (symbol, category), if it exists."""
-    compact = asset.upper().replace("/", "").replace(" ", "").replace("-", "")
+    compact = normalize_asset(asset)
     if compact.endswith("USDT"):
         candidates = [compact]
     elif compact.endswith("USD"):
@@ -344,18 +576,70 @@ async def resolve_bybit_symbol(asset: str) -> Optional[tuple[str, str]]:
     else:
         candidates = [compact + "USDT"]
 
-    async with httpx.AsyncClient(timeout=10) as http:
-        for symbol in candidates:
-            for category in BYBIT_CATEGORIES:
-                if await fetch_bybit_price(http, symbol, category) is not None:
-                    return symbol, category
+    for symbol in candidates:
+        for category in BYBIT_CATEGORIES:
+            if await fetch_bybit_price(http, symbol, category) is not None:
+                return symbol, category
     return None
 
 
+# ---------------------------------------------------------------------------
+# Provider routing: FXCM first (forex, metals, indices), Bybit for crypto
+# ---------------------------------------------------------------------------
+
+async def resolve_market(asset: str) -> Optional[dict]:
+    """Pick where to source live prices for an asset.
+
+    FXCM is preferred because it covers forex, metals and indices, which Bybit
+    does not list. Bybit is the fallback for crypto pairs (and for everything,
+    when no FXCM token is configured).
+    """
+    async with httpx.AsyncClient(timeout=15) as http:
+        if fxcm_enabled():
+            offers = await fxcm_offers(http)
+            available = {symbol.upper(): symbol for symbol in offers}
+            for candidate in fxcm_symbol_candidates(asset):
+                symbol = available.get(candidate.upper())
+                if symbol:
+                    return {"provider": "fxcm", "symbol": symbol}
+
+        resolved = await resolve_bybit_symbol(http, asset)
+        if resolved:
+            symbol, category = resolved
+            return {"provider": "bybit", "symbol": symbol, "category": category}
+    return None
+
+
+async def fetch_trade_price(
+    http: httpx.AsyncClient, trade: dict, offers: dict[str, float]
+) -> Optional[float]:
+    """Current price for a monitored trade, from whichever provider owns it."""
+    if trade.get("provider") == "fxcm":
+        return offers.get(trade["symbol"])
+    return await fetch_bybit_price(
+        http, trade["symbol"], trade.get("category", "linear")
+    )
+
+
 def check_trade(trade: dict, price: float) -> Optional[str]:
-    """Return an event for the trade at this price: 'tp', 'sl', 'breakeven', None."""
+    """Return the event for this trade at this price, or None.
+
+    A pending order (LIMIT/STOP) is not a position yet, so it can only report
+    'entry' (price touched the entry level, order filled) or 'missed' (price
+    ran all the way to TP without ever filling — the setup is void).
+
+    Once filled, the trade reports 'tp', 'sl' or 'breakeven'.
+    """
     long = trade["direction"] == "LONG"
-    if (price >= trade["tp"]) if long else (price <= trade["tp"]):
+    reached_tp = (price >= trade["tp"]) if long else (price <= trade["tp"])
+
+    if trade.get("status") == "pending":
+        if (price <= trade["entry"]) if trade.get("fill_direction") == "down" \
+                else (price >= trade["entry"]):
+            return "entry"
+        return "missed" if reached_tp else None
+
+    if reached_tp:
         return "tp"
     if (price <= trade["sl"]) if long else (price >= trade["sl"]):
         return "sl"
@@ -363,6 +647,17 @@ def check_trade(trade: dict, price: float) -> Optional[str]:
         if (price >= trade["be_price"]) if long else (price <= trade["be_price"]):
             return "breakeven"
     return None
+
+
+def trade_expired(trade: dict, now: datetime) -> bool:
+    """True once a trade has been monitored for longer than TRADE_TTL_HOURS."""
+    if TRADE_TTL_HOURS <= 0:
+        return False
+    try:
+        created = datetime.fromisoformat(trade["created_at"])
+    except (KeyError, ValueError):
+        return False
+    return now - created >= timedelta(hours=TRADE_TTL_HOURS)
 
 
 TP_MESSAGES = [
@@ -395,18 +690,57 @@ FALLBACK_MORNING = [
     "capital and the wins will follow. 🚀",
 ]
 
+FALLBACK_NIGHT = [
+    "🌙 Markets close, the work doesn't. Journal today's trades — what you "
+    "did right matters as much as what you'd change. Rest well; a sharp mind "
+    "is your real edge. 😴",
+    "🌙 Day's done. Green or red, you followed a process — that's the part "
+    "you control. Screens off, review tomorrow with fresh eyes. 🧠",
+    "🌙 Wrap it up for today. No revenge trades, no late-night chasing. The "
+    "market will hand out new setups tomorrow, and you'll be rested for "
+    "them. 🌟",
+]
+
+
+async def deliver(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str) -> None:
+    """Push a message to a chat; a delivery failure must not abort the job."""
+    try:
+        await context.bot.send_message(chat_id=chat_id, text=text)
+    except Exception:
+        logger.exception("Could not deliver message to chat %s", chat_id)
+
 
 async def monitor_trades(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Periodic job: check live prices for all active trades."""
+    """Periodic job: check live prices for all monitored trades."""
     trades = state["trades"]
     if not trades:
         return
 
-    async with httpx.AsyncClient(timeout=10) as http:
+    now = datetime.now(dt_timezone.utc)
+
+    async with httpx.AsyncClient(timeout=15) as http:
+        # One FXCM snapshot covers every FXCM-priced trade this cycle
+        offers = (
+            await fxcm_offers(http)
+            if any(t.get("provider") == "fxcm" for t in trades)
+            else {}
+        )
+
         for trade in list(trades):
-            price = await fetch_bybit_price(
-                http, trade["symbol"], trade.get("category", "linear")
-            )
+            decimals = trade.get("decimals", 2)
+
+            if trade_expired(trade, now):
+                trades.remove(trade)
+                save_state()
+                await deliver(
+                    context, trade["chat_id"],
+                    f"⌛ Stopped monitoring {trade['asset']} — no result after "
+                    f"{TRADE_TTL_HOURS:g}h. Re-send the chart if the setup is "
+                    "still valid.",
+                )
+                continue
+
+            price = await fetch_trade_price(http, trade, offers)
             if price is None:
                 continue
 
@@ -414,8 +748,23 @@ async def monitor_trades(context: ContextTypes.DEFAULT_TYPE) -> None:
             if event is None:
                 continue
 
-            decimals = trade.get("decimals", 2)
-            if event == "breakeven":
+            if event == "entry":
+                trade["status"] = "active"
+                text = (
+                    f"✅ {trade['asset']}: price touched your entry "
+                    f"{trade['entry']:.{decimals}f} — the order should be "
+                    "filled. Now watching for breakeven, TP and SL."
+                )
+            elif event == "missed":
+                trades.remove(trade)
+                text = (
+                    f"🚪 {trade['asset']}: price reached TP "
+                    f"({trade['tp']:.{decimals}f}) without ever filling your "
+                    f"entry at {trade['entry']:.{decimals}f}. The setup played "
+                    "out without you — no loss taken. Missing a trade costs "
+                    "nothing; chasing one does. 🧠"
+                )
+            elif event == "breakeven":
                 trade["be_alerted"] = True
                 text = (
                     f"🔒 {trade['asset']}: price reached "
@@ -424,63 +773,235 @@ async def monitor_trades(context: ContextTypes.DEFAULT_TYPE) -> None:
                     "to make this a risk-free trade."
                 )
             elif event == "tp":
-                state["trades"].remove(trade)
+                trades.remove(trade)
                 text = random.choice(TP_MESSAGES).format(
                     asset=trade["asset"], profit=trade["profit_pct"]
                 )
             else:  # sl
-                state["trades"].remove(trade)
+                trades.remove(trade)
                 text = random.choice(SL_MESSAGES).format(
                     asset=trade["asset"], loss=trade["loss_pct"]
                 )
 
             save_state()
-            try:
-                await context.bot.send_message(chat_id=trade["chat_id"], text=text)
-            except Exception:
-                logger.exception("Could not deliver alert to chat %s", trade["chat_id"])
+            await deliver(context, trade["chat_id"], text)
 
 
 # ---------------------------------------------------------------------------
-# Morning motivation
+# Scheduled motivation texts (morning + night)
+#
+# These are driven by the date recorded in state, not by a fire-once timer:
+# a free host that sleeps through the scheduled minute would silently skip an
+# APScheduler job, whereas here the bot notices on its next check that today's
+# text hasn't gone out yet and sends it (up to CATCHUP_HOURS late).
 # ---------------------------------------------------------------------------
 
-def generate_motivation() -> str:
-    """Fresh morning motivation via Gemini, with a static fallback (sync)."""
-    prompt = (
+SCHEDULE_PROMPTS = {
+    "morning": (
         "Write a short, energetic good-morning motivation message for a day "
         "trader. 2-3 sentences, include one practical reminder about discipline "
         "or risk management, a couple of fitting emojis, no hashtags, no "
         "preamble — output the message text only."
-    )
+    ),
+    "night": (
+        "Write a short, calm end-of-day message for a day trader who is "
+        "finishing their trading session. 2-3 sentences: encourage them to "
+        "review or journal today's trades, discourage revenge trading, and "
+        "remind them that rest sharpens judgement. A couple of fitting emojis, "
+        "no hashtags, no preamble — output the message text only."
+    ),
+}
+
+SCHEDULE_FALLBACKS = {"morning": FALLBACK_MORNING, "night": FALLBACK_NIGHT}
+
+
+def generate_motivation(slot: str = "morning") -> str:
+    """Fresh motivation text via Gemini, with a static fallback (sync)."""
     for model in GEMINI_MODELS:
         try:
             response = gemini_client.models.generate_content(
-                model=model, contents=prompt
+                model=model, contents=SCHEDULE_PROMPTS[slot]
             )
             text = (response.text or "").strip()
             if text:
                 return text
-        except Exception:
-            continue
-    return random.choice(FALLBACK_MORNING)
+        except Exception as error:  # noqa: BLE001 - fall through to next model
+            logger.warning("Model %s failed for %s text: %s", model, slot, error)
+    logger.info("Using a static fallback for the %s text", slot)
+    return random.choice(SCHEDULE_FALLBACKS[slot])
 
 
-async def morning_motivation(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Daily job: send a motivation text to every registered chat."""
+async def broadcast_motivation(
+    context: ContextTypes.DEFAULT_TYPE, slot: str
+) -> None:
+    text = await asyncio.to_thread(generate_motivation, slot)
+    chats = list(state["chats"])
+    logger.info("Sending %s text to %d chat(s)", slot, len(chats))
+    for chat_id in chats:
+        await deliver(context, chat_id, text)
+
+
+async def scheduled_texts(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Periodic job: send any motivation text that is due and unsent today."""
     if not state["chats"]:
         return
-    text = await asyncio.to_thread(generate_motivation)
-    for chat_id in list(state["chats"]):
-        try:
-            await context.bot.send_message(chat_id=chat_id, text=text)
-        except Exception:
-            logger.exception("Could not deliver morning message to chat %s", chat_id)
+
+    now = datetime.now(local_timezone())
+    today = now.date().isoformat()
+
+    for slot, hour in (("morning", MORNING_HOUR), ("night", NIGHT_HOUR)):
+        if state["last_sent"].get(slot) == today:
+            continue
+        due = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+        if now < due:
+            continue
+
+        # Record the attempt before sending: a delivery failure must not make
+        # the bot retry on every tick for the rest of the day.
+        state["last_sent"][slot] = today
+        save_state()
+
+        late = now - due
+        if late > timedelta(hours=CATCHUP_HOURS):
+            logger.info(
+                "Skipping the %s text for %s — %.1fh late (limit %sh)",
+                slot, today, late.total_seconds() / 3600, CATCHUP_HOURS,
+            )
+            continue
+
+        if late > timedelta(seconds=SCHEDULE_INTERVAL):
+            logger.info("Catching up on the %s text (%.1fh late)",
+                        slot, late.total_seconds() / 3600)
+        await broadcast_motivation(context, slot)
+
+
+# ---------------------------------------------------------------------------
+# Monitored-trade bookkeeping
+# ---------------------------------------------------------------------------
+
+def _close(a: float, b: float) -> bool:
+    return abs(a - b) <= abs(b) * DUPLICATE_TOLERANCE
+
+
+def find_duplicate_trade(
+    chat_id: int, data: TradeData, symbol: str
+) -> Optional[dict]:
+    """The already-monitored trade matching this setup, if there is one.
+
+    Re-reading the same chart can shift a digit, so levels are compared with a
+    small relative tolerance rather than for exact equality.
+    """
+    for trade in state["trades"]:
+        if (trade["chat_id"] != chat_id or trade["symbol"] != symbol
+                or trade["direction"] != data.direction):
+            continue
+        if (_close(trade["entry"], data.entry)
+                and _close(trade["sl"], data.stop_loss)
+                and _close(trade["tp"], data.take_profit)):
+            return trade
+    return None
+
+
+def chat_trades(chat_id: int) -> list[dict]:
+    return [t for t in state["trades"] if t["chat_id"] == chat_id]
+
+
+def describe_trade(trade: dict, index: int) -> str:
+    decimals = trade.get("decimals", 2)
+    status = "⏳ pending entry" if trade.get("status") == "pending" else "🔴 live"
+    return (
+        f"{index}. {trade['asset']} {trade['direction']} — {status}\n"
+        f"   entry {trade['entry']:.{decimals}f} · "
+        f"SL {trade['sl']:.{decimals}f} · TP {trade['tp']:.{decimals}f}"
+    )
 
 
 # ---------------------------------------------------------------------------
 # Telegram handlers
 # ---------------------------------------------------------------------------
+
+async def list_trades(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/trades — show what is currently being monitored in this chat."""
+    message = update.effective_message
+    register_chat(message.chat_id)
+    trades = chat_trades(message.chat_id)
+    if not trades:
+        await message.reply_text(
+            "No trades are being monitored here. Send a chart screenshot to "
+            "start one."
+        )
+        return
+    lines = [describe_trade(t, i) for i, t in enumerate(trades, start=1)]
+    await message.reply_text(
+        "📋 Monitored trades:\n\n" + "\n".join(lines)
+        + "\n\nUse /cancel <number> to stop one, or /cancel all."
+    )
+
+
+async def cancel_trade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/cancel [n|all] — stop monitoring one trade, or all of them."""
+    message = update.effective_message
+    trades = chat_trades(message.chat_id)
+    if not trades:
+        await message.reply_text("Nothing to cancel — no trades are being monitored.")
+        return
+
+    arg = context.args[0].lower() if context.args else ""
+
+    if arg == "all" or (not arg and len(trades) == 1):
+        for trade in trades:
+            state["trades"].remove(trade)
+        save_state()
+        await message.reply_text(
+            f"🗑️ Stopped monitoring {len(trades)} trade(s). No further alerts."
+        )
+        return
+
+    if not arg:
+        lines = [describe_trade(t, i) for i, t in enumerate(trades, start=1)]
+        await message.reply_text(
+            "Which one? Send /cancel <number> or /cancel all.\n\n" + "\n".join(lines)
+        )
+        return
+
+    if not arg.isdigit() or not 1 <= int(arg) <= len(trades):
+        await message.reply_text(
+            f"Pick a number between 1 and {len(trades)}, or use /cancel all. "
+            "See /trades for the list."
+        )
+        return
+
+    trade = trades[int(arg) - 1]
+    state["trades"].remove(trade)
+    save_state()
+    await message.reply_text(
+        f"🗑️ Stopped monitoring {trade['asset']} {trade['direction']}. "
+        "No further alerts for it."
+    )
+
+
+async def send_motivation_now(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, slot: str
+) -> None:
+    """Generate and send one motivation text immediately, for testing."""
+    message = update.effective_message
+    register_chat(message.chat_id)
+    await context.bot.send_chat_action(
+        chat_id=message.chat_id, action=ChatAction.TYPING
+    )
+    text = await asyncio.to_thread(generate_motivation, slot)
+    await message.reply_text(text)
+
+
+async def motivate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/motivate — send the morning text now instead of waiting for it."""
+    await send_motivation_now(update, context, "morning")
+
+
+async def night(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/night — send the night text now instead of waiting for it."""
+    await send_motivation_now(update, context, "night")
+
 
 async def handle_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle an incoming chart image (photo or image file)."""
@@ -518,40 +1039,74 @@ async def handle_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
         await message.reply_text(build_signal_message(data))
 
-        # Register the trade for live monitoring (pairs listed on Bybit)
-        resolved = await resolve_bybit_symbol(data.asset)
+        # Register the trade for live monitoring (FXCM, or Bybit for crypto)
+        market = await resolve_market(data.asset)
+        if not market:
+            hint = "" if fxcm_enabled() else (
+                " Set FXCM_ACCESS_TOKEN to enable forex, metals and indices."
+            )
+            await message.reply_text(
+                f"ℹ️ Live monitoring isn't available for {data.asset.upper()} "
+                f"(no matching instrument) — breakeven/TP/SL alerts are off "
+                f"for this trade.{hint}"
+            )
+            return
+
+        symbol = market["symbol"]
         decimals = signal_decimals(data)
+
+        existing = find_duplicate_trade(message.chat_id, data, symbol)
+        if existing:
+            await message.reply_text(
+                f"🔁 Already monitoring this {data.asset.upper()} setup "
+                f"({'pending entry' if existing['status'] == 'pending' else 'live'})"
+                " — not adding it twice. Use /trades to see it or /cancel to drop it."
+            )
+            return
+
         be_price = breakeven_price(data)
         profit, loss = calculate_percentages(data)
-        if resolved:
-            symbol, category = resolved
-            state["trades"].append({
-                "chat_id": message.chat_id,
-                "asset": data.asset.upper(),
-                "symbol": symbol,
-                "category": category,
-                "direction": data.direction,
-                "entry": data.entry,
-                "sl": data.stop_loss,
-                "tp": data.take_profit,
-                "be_price": be_price,
-                "be_alerted": False,
-                "decimals": decimals,
-                "profit_pct": profit,
-                "loss_pct": loss,
-            })
-            save_state()
+        fill = entry_fill_direction(data)
+        state["trades"].append({
+            "chat_id": message.chat_id,
+            "asset": data.asset.upper(),
+            "provider": market["provider"],
+            "symbol": symbol,
+            "category": market.get("category", "linear"),
+            "direction": data.direction,
+            "entry": data.entry,
+            "sl": data.stop_loss,
+            "tp": data.take_profit,
+            "be_price": be_price,
+            "be_alerted": False,
+            "decimals": decimals,
+            "profit_pct": profit,
+            "loss_pct": loss,
+            # A pending order isn't a position yet — no TP/SL/breakeven alerts
+            # until price actually touches the entry level.
+            "status": "pending" if fill else "active",
+            "fill_direction": fill,
+            "created_at": utcnow_iso(),
+        })
+        save_state()
+
+        if fill:
+            expiry = (
+                f"\nMonitoring stops automatically after {TRADE_TTL_HOURS:g}h."
+                if TRADE_TTL_HOURS > 0 else ""
+            )
+            await message.reply_text(
+                f"🔔 Pending order registered. I'll tell you when price "
+                f"reaches your entry at {data.entry:.{decimals}f}, then watch "
+                f"for breakeven ({be_price:.{decimals}f}), TP and SL."
+                f"{expiry}"
+            )
+        else:
             await message.reply_text(
                 f"🔔 Trade is being monitored live.\n"
                 f"I'll alert you to move SL to breakeven at "
                 f"{be_price:.{decimals}f} (30% of the way to TP), and again "
                 f"when TP or SL is hit."
-            )
-        else:
-            await message.reply_text(
-                f"ℹ️ Live monitoring isn't available for {data.asset.upper()} "
-                "(no matching Bybit pair) — breakeven/TP/SL alerts are off "
-                "for this trade."
             )
     except Exception:
         logger.exception("Failed to process chart")
@@ -566,29 +1121,66 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "👋 Send me a screenshot of a trading chart with a long/short position "
         "tool drawn on it (entry, stop loss, take profit) and I'll reply with a "
         "formatted signal.\n\n"
-        "I'll also monitor the trade live (crypto pairs), alert you to move SL "
-        "to breakeven at 30% of the way to TP, message you when TP/SL hits, "
-        "and send a motivation text every morning. 🌅"
+        "I'll also monitor the trade live: I tell you when a pending order "
+        "fills, when to move SL to breakeven at 30% of the way to TP, and "
+        "when TP/SL hits — plus a motivation text every morning 🌅 and "
+        "night 🌙.\n\n"
+        "/trades — what I'm currently watching\n"
+        "/cancel — stop watching a trade\n"
+        "/motivate — morning text now\n"
+        "/night — night text now"
     )
 
 
+BOT_COMMANDS = [
+    ("start", "How to use the bot"),
+    ("trades", "List trades being monitored"),
+    ("cancel", "Stop monitoring a trade"),
+    ("motivate", "Send the morning text now"),
+    ("night", "Send the night text now"),
+]
+
+
+async def register_commands(app: Application) -> None:
+    """Populate the in-app command menu (best effort — never block startup)."""
+    try:
+        await app.bot.set_my_commands(BOT_COMMANDS)
+    except Exception:
+        logger.warning("Could not set the bot command menu", exc_info=True)
+
+
 def main() -> None:
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .post_init(register_commands)
+        .build()
+    )
 
     # Chart images only — text and any other message types are ignored
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("trades", list_trades))
+    app.add_handler(CommandHandler("cancel", cancel_trade))
+    app.add_handler(CommandHandler("motivate", motivate))
+    app.add_handler(CommandHandler("night", night))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_chart))
 
-    # Background jobs: trade monitoring + daily morning motivation
+    # Background jobs: trade monitoring + the morning/night texts. Both are
+    # repeating checks rather than one-shot daily timers, so a missed window
+    # (host asleep, restart) is recovered instead of silently skipped.
     app.job_queue.run_repeating(monitor_trades, interval=MONITOR_INTERVAL, first=10)
-    try:
-        tz = pytz.timezone(TIMEZONE)
-    except pytz.UnknownTimeZoneError:
-        logger.warning("Unknown TIMEZONE %r, falling back to UTC", TIMEZONE)
-        tz = pytz.utc
-    app.job_queue.run_daily(
-        morning_motivation,
-        time=dtime(hour=MORNING_HOUR, tzinfo=tz),
+    app.job_queue.run_repeating(scheduled_texts, interval=SCHEDULE_INTERVAL, first=15)
+
+    tz = local_timezone()
+    logger.info(
+        "Motivation texts: morning %02d:00, night %02d:00 (%s, now %s)",
+        MORNING_HOUR, NIGHT_HOUR, tz.key,
+        datetime.now(tz).strftime("%Y-%m-%d %H:%M"),
+    )
+    logger.info(
+        "Live prices: %s",
+        f"FXCM ({FXCM_HOST}) with Bybit fallback" if fxcm_enabled()
+        else "Bybit only — set FXCM_ACCESS_TOKEN for forex/metals/indices",
     )
 
     # On Render (and similar hosts) RENDER_EXTERNAL_URL is set automatically:

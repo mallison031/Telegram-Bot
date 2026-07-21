@@ -3,3 +3,7 @@
 venv/
 __pycache__/
 *.pyc
+
+# Runtime state: chat IDs and open trades — never commit
+state.json
+bot.log
