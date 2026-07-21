@@ -11,7 +11,7 @@ trusting the AI with math), and replies with a formatted signal:
     Profit: +[X]% / Loss: -[Y]%
 
 Extra features:
-- Live trade monitoring (FXCM REST API, with Bybit as a crypto fallback):
+- Live trade monitoring (OANDA v20 REST API, with Bybit as a crypto fallback):
   alerts when a pending order fills, when to move SL to breakeven once price
   covers 30% of the distance to TP, and a motivation message on TP or SL.
 - Morning and night motivation texts to every chat that has used the bot.
@@ -57,10 +57,13 @@ MORNING_HOUR = int(os.environ.get("MORNING_HOUR", "8"))
 NIGHT_HOUR = int(os.environ.get("NIGHT_HOUR", "22"))
 STATE_FILE = Path(os.environ.get("STATE_FILE", "state.json"))
 
-# FXCM credentials. Generate a token in Trading Station Web -> User Account ->
-# Token Management. Without a token FXCM is skipped and Bybit is used alone.
-FXCM_ACCESS_TOKEN = os.environ.get("FXCM_ACCESS_TOKEN", "").strip()
-FXCM_SERVER = os.environ.get("FXCM_SERVER", "demo").strip().lower()
+# OANDA credentials. Generate a personal access token in the OANDA account
+# portal -> Manage API Access. A practice token carries the same live prices
+# as a live one. Without a token OANDA is skipped and Bybit is used alone.
+OANDA_ACCESS_TOKEN = os.environ.get("OANDA_ACCESS_TOKEN", "").strip()
+OANDA_ENV = os.environ.get("OANDA_ENV", "practice").strip().lower()
+# Optional: pin a specific account. Left blank, the first one is used.
+OANDA_ACCOUNT_ID = os.environ.get("OANDA_ACCOUNT_ID", "").strip()
 
 # Fraction of the entry->TP distance that triggers the breakeven alert
 BREAKEVEN_FRACTION = 0.30
@@ -80,8 +83,11 @@ SCHEDULE_INTERVAL = 300
 # at a nonsensical time (e.g. the morning text arriving at 6pm).
 CATCHUP_HOURS = 6
 
-FXCM_HOST = "api-demo.fxcm.com" if FXCM_SERVER == "demo" else "api.fxcm.com"
-FXCM_BASE_URL = f"https://{FXCM_HOST}:443"
+OANDA_HOST = (
+    "api-fxpractice.oanda.com" if OANDA_ENV == "practice"
+    else "api-fxtrade.oanda.com"
+)
+OANDA_BASE_URL = f"https://{OANDA_HOST}"
 
 BYBIT_TICKERS_URL = "https://api.bybit.com/v5/market/tickers"
 # Bybit market categories to search for a pair, in order of preference:
@@ -367,174 +373,182 @@ def validate(data: TradeData) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Live prices, provider 1: FXCM REST API (needs FXCM_ACCESS_TOKEN)
+# Live prices, provider 1: OANDA v20 REST API (needs OANDA_ACCESS_TOKEN)
 #
-# FXCM authenticates with "Bearer <socket_id><token>", where socket_id comes
-# from a socket.io handshake. We only need snapshots, so instead of holding a
-# streaming connection we do the polling handshake once, cache the id, and
-# reuse it until the API rejects it. One get_model call returns every
-# instrument, so a monitoring cycle costs a single request no matter how many
-# trades are open.
+# A practice token carries the same live market feed as a live one — only
+# order execution differs, and this bot never places orders. The pricing
+# endpoint takes a CSV list of instruments, so one request per cycle prices
+# every open trade no matter how many there are.
 # ---------------------------------------------------------------------------
 
-# FXCM names instruments "EUR/USD", "XAU/USD", "SPX500", "USOil". Anything not
-# listed here is handled by the generic 6-letter -> "XXX/YYY" rule.
-FXCM_ALIASES = {
-    "XAUUSD": "XAU/USD", "GOLD": "XAU/USD",
-    "XAGUSD": "XAG/USD", "SILVER": "XAG/USD",
-    "USOIL": "USOil", "WTI": "USOil", "UKOIL": "UKOil", "BRENT": "UKOil",
-    "SPX500": "SPX500", "US500": "SPX500", "SP500": "SPX500",
-    "NAS100": "NAS100", "USTEC": "NAS100", "NASDAQ": "NAS100",
-    "US30": "US30", "DJI": "US30", "DOW": "US30",
-    "GER30": "GER30", "DAX": "GER30", "GER40": "GER30",
-    "UK100": "UK100", "FTSE": "UK100", "JPN225": "JPN225", "NIKKEI": "JPN225",
+# OANDA names instruments "EUR_USD", "XAU_USD", "US30_USD". Anything not
+# listed here falls back to the generic 6-letter -> "XXX_YYY" rule, and every
+# candidate is checked against the account's real instrument list anyway.
+OANDA_ALIASES = {
+    "XAUUSD": "XAU_USD", "GOLD": "XAU_USD",
+    "XAGUSD": "XAG_USD", "SILVER": "XAG_USD",
+    "USOIL": "WTICO_USD", "WTI": "WTICO_USD", "CRUDE": "WTICO_USD",
+    "UKOIL": "BCO_USD", "BRENT": "BCO_USD", "NATGAS": "NATGAS_USD",
+    "US30": "US30_USD", "DJI": "US30_USD", "DOW": "US30_USD",
+    "NAS100": "NAS100_USD", "USTEC": "NAS100_USD", "NASDAQ": "NAS100_USD",
+    "SPX500": "SPX500_USD", "US500": "SPX500_USD", "SP500": "SPX500_USD",
+    "GER30": "DE30_EUR", "GER40": "DE30_EUR", "DAX": "DE30_EUR",
+    "UK100": "UK100_GBP", "FTSE": "UK100_GBP",
+    "JPN225": "JP225_USD", "NIKKEI": "JP225_USD",
+    "AUS200": "AU200_AUD", "HK50": "HK33_HKD",
 }
 
-_fxcm_socket_id: Optional[str] = None
-# FXCM's own docs disagree on whether the bearer has a space between the socket
-# id and the token, so we learn which form this server accepts and keep it.
-# Once a request has succeeded the separator is settled and never flipped
-# again — after that a 401 means the session expired, not a bad header.
-_fxcm_bearer_sep = ""
-_fxcm_bearer_confirmed = False
+_oanda_account_id: Optional[str] = None
+_oanda_instruments: Optional[set[str]] = None
 
 
-def fxcm_enabled() -> bool:
-    return bool(FXCM_ACCESS_TOKEN)
+def oanda_enabled() -> bool:
+    return bool(OANDA_ACCESS_TOKEN)
+
+
+def oanda_headers() -> dict:
+    return {
+        "Authorization": f"Bearer {OANDA_ACCESS_TOKEN}",
+        "Accept-Datetime-Format": "RFC3339",
+    }
 
 
 def normalize_asset(asset: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", asset.upper())
 
 
-def fxcm_symbol_candidates(asset: str) -> list[str]:
-    """FXCM instrument names to try for an asset like 'EURUSD' or 'XAUUSD'."""
+def oanda_symbol_candidates(asset: str) -> list[str]:
+    """OANDA instrument names to try for an asset like 'EURUSD' or 'XAUUSD'."""
     compact = normalize_asset(asset)
     candidates = []
-    if compact in FXCM_ALIASES:
-        candidates.append(FXCM_ALIASES[compact])
-    # Crypto charts often read as USDT pairs; FXCM quotes them against USD
+    if compact in OANDA_ALIASES:
+        candidates.append(OANDA_ALIASES[compact])
+    # Crypto charts often read as USDT pairs; OANDA quotes them against USD
     if compact.endswith("USDT"):
         compact = compact[:-1]
     if len(compact) == 6:
-        candidates.append(f"{compact[:3]}/{compact[3:]}")
+        candidates.append(f"{compact[:3]}_{compact[3:]}")
     candidates.append(compact)
     return list(dict.fromkeys(candidates))
 
 
-def offer_price(offer: dict) -> Optional[float]:
-    """Mid price from an FXCM offer row, tolerating either field naming."""
-    for bid_key, ask_key in (("sell", "buy"), ("rateBid", "rateAsk")):
+def oanda_price(row: dict) -> Optional[float]:
+    """Mid price from an OANDA price row, preferring the closeout quotes."""
+    def mid(bid, ask) -> Optional[float]:
         try:
-            bid = float(offer[bid_key])
-            ask = float(offer[ask_key])
-        except (KeyError, TypeError, ValueError):
-            continue
-        if bid > 0 and ask > 0:
-            return (bid + ask) / 2
-    return None
+            bid, ask = float(bid), float(ask)
+        except (TypeError, ValueError):
+            return None
+        return (bid + ask) / 2 if bid > 0 and ask > 0 else None
+
+    price = mid(row.get("closeoutBid"), row.get("closeoutAsk"))
+    if price is not None:
+        return price
+    try:
+        return mid(row["bids"][0]["price"], row["asks"][0]["price"])
+    except (KeyError, IndexError, TypeError):
+        return None
 
 
-async def fxcm_handshake(http: httpx.AsyncClient) -> Optional[str]:
-    """Open a socket.io polling handshake and return the session id."""
-    global _fxcm_socket_id
-    if _fxcm_socket_id:
-        return _fxcm_socket_id
+async def oanda_get(http: httpx.AsyncClient, path: str, **params) -> Optional[dict]:
+    """GET an OANDA endpoint, returning parsed JSON or None on any failure."""
     try:
         response = await http.get(
-            f"{FXCM_BASE_URL}/socket.io/",
-            params={
-                "access_token": FXCM_ACCESS_TOKEN,
-                "EIO": "3",
-                "transport": "polling",
-            },
+            f"{OANDA_BASE_URL}{path}", params=params or None, headers=oanda_headers()
         )
     except httpx.HTTPError as error:
-        logger.warning("FXCM handshake failed: %s", error)
+        logger.warning("OANDA request to %s failed: %s", path, error)
         return None
-    if response.status_code != 200:
+
+    if response.status_code in (401, 403):
         logger.warning(
-            "FXCM handshake rejected (HTTP %s) — check FXCM_ACCESS_TOKEN "
-            "and FXCM_SERVER (%s)", response.status_code, FXCM_SERVER
+            "OANDA rejected the token (HTTP %s) — check OANDA_ACCESS_TOKEN and "
+            "OANDA_ENV (%s, host %s)",
+            response.status_code, OANDA_ENV, OANDA_HOST,
         )
         return None
-    # engine.io replies with a length-prefixed frame: 97:0{"sid":"...",...}
-    match = re.search(r'"sid"\s*:\s*"([^"]+)"', response.text)
-    if not match:
-        logger.warning("FXCM handshake returned no session id")
+    if response.status_code != 200:
+        logger.warning("OANDA %s returned HTTP %s", path, response.status_code)
         return None
-    _fxcm_socket_id = match.group(1)
-    logger.info("FXCM session established (%s)", FXCM_HOST)
-    return _fxcm_socket_id
+    try:
+        return response.json()
+    except ValueError:
+        logger.warning("OANDA %s returned a non-JSON response", path)
+        return None
 
 
-def fxcm_headers(socket_id: str) -> dict:
-    return {
-        "User-Agent": "trading-chart-bot",
-        "Accept": "application/json",
-        "Authorization": f"Bearer {socket_id}{_fxcm_bearer_sep}{FXCM_ACCESS_TOKEN}",
+async def oanda_account_id(http: httpx.AsyncClient) -> Optional[str]:
+    """The account to price against — from config, else the first one found."""
+    global _oanda_account_id
+    if _oanda_account_id:
+        return _oanda_account_id
+    if OANDA_ACCOUNT_ID:
+        _oanda_account_id = OANDA_ACCOUNT_ID
+        return _oanda_account_id
+
+    payload = await oanda_get(http, "/v3/accounts")
+    accounts = (payload or {}).get("accounts") or []
+    if not accounts:
+        logger.warning("OANDA returned no accounts for this token")
+        return None
+    _oanda_account_id = accounts[0].get("id")
+    if len(accounts) > 1:
+        logger.info(
+            "OANDA token has %d accounts, using %s (set OANDA_ACCOUNT_ID to pin one)",
+            len(accounts), _oanda_account_id,
+        )
+    else:
+        logger.info("OANDA account %s (%s)", _oanda_account_id, OANDA_HOST)
+    return _oanda_account_id
+
+
+async def oanda_instruments(http: httpx.AsyncClient) -> set[str]:
+    """Instrument names this account can price, fetched once and cached."""
+    global _oanda_instruments
+    if _oanda_instruments is not None:
+        return _oanda_instruments
+
+    account = await oanda_account_id(http)
+    if not account:
+        return set()
+    payload = await oanda_get(http, f"/v3/accounts/{account}/instruments")
+    if payload is None:
+        return set()  # transient: leave uncached so we retry next time
+    names = {
+        item["name"] for item in payload.get("instruments") or [] if item.get("name")
     }
+    _oanda_instruments = names
+    logger.info("OANDA offers %d instruments on this account", len(names))
+    return names
 
 
-async def fxcm_offers(http: httpx.AsyncClient) -> dict[str, float]:
-    """Snapshot of every instrument FXCM is quoting: {symbol: mid price}.
+async def oanda_prices(
+    http: httpx.AsyncClient, symbols: set[str]
+) -> dict[str, float]:
+    """Current mid prices for the given instruments: {name: price}.
 
-    Returns an empty dict on any failure — callers fall back to Bybit.
+    Returns an empty dict on any failure — trades are simply skipped this
+    cycle rather than acting on a stale or missing quote.
     """
-    global _fxcm_socket_id, _fxcm_bearer_sep, _fxcm_bearer_confirmed
-    if not fxcm_enabled():
+    if not symbols or not oanda_enabled():
+        return {}
+    account = await oanda_account_id(http)
+    if not account:
         return {}
 
-    attempts = 3
-    for attempt in range(attempts):
-        socket_id = await fxcm_handshake(http)
-        if not socket_id:
-            return {}
-        try:
-            response = await http.get(
-                f"{FXCM_BASE_URL}/trading/get_model",
-                params={"models": "Offer"},
-                headers=fxcm_headers(socket_id),
-            )
-        except httpx.HTTPError as error:
-            logger.warning("FXCM get_model failed: %s", error)
-            return {}
+    payload = await oanda_get(
+        http, f"/v3/accounts/{account}/pricing", instruments=",".join(sorted(symbols))
+    )
+    if payload is None:
+        return {}
 
-        if response.status_code in (401, 403):
-            # The session id may have expired — always drop it. Only flip the
-            # header format while it is still unproven; flipping a separator
-            # that has already worked would break a good session refresh.
-            _fxcm_socket_id = None
-            if not _fxcm_bearer_confirmed:
-                _fxcm_bearer_sep = " " if _fxcm_bearer_sep == "" else ""
-            if attempt < attempts - 1:
-                continue
-            logger.warning(
-                "FXCM rejected our credentials (HTTP %s) — check "
-                "FXCM_ACCESS_TOKEN and FXCM_SERVER (%s)",
-                response.status_code, FXCM_SERVER,
-            )
-            return {}
-
-        _fxcm_bearer_confirmed = True
-        try:
-            payload = response.json()
-        except ValueError:
-            logger.warning("FXCM returned a non-JSON response")
-            return {}
-
-        offers = payload.get("offers") or []
-        prices = {}
-        for offer in offers:
-            symbol = offer.get("currency")
-            price = offer_price(offer)
-            if symbol and price:
-                prices[symbol] = price
-        if not prices:
-            logger.warning("FXCM offer table was empty — subscribe the "
-                           "instruments you trade in Trading Station")
-        return prices
-    return {}
+    prices = {}
+    for row in payload.get("prices") or []:
+        name = row.get("instrument")
+        price = oanda_price(row)
+        if name and price:
+            prices[name] = price
+    return prices
 
 
 # ---------------------------------------------------------------------------
@@ -584,24 +598,23 @@ async def resolve_bybit_symbol(
 
 
 # ---------------------------------------------------------------------------
-# Provider routing: FXCM first (forex, metals, indices), Bybit for crypto
+# Provider routing: OANDA first (forex, metals, indices), Bybit for crypto
 # ---------------------------------------------------------------------------
 
 async def resolve_market(asset: str) -> Optional[dict]:
     """Pick where to source live prices for an asset.
 
-    FXCM is preferred because it covers forex, metals and indices, which Bybit
-    does not list. Bybit is the fallback for crypto pairs (and for everything,
-    when no FXCM token is configured).
+    OANDA is preferred because it covers forex, metals and indices, which
+    Bybit does not list. Bybit is the fallback for crypto pairs (and for
+    everything, when no OANDA token is configured).
     """
     async with httpx.AsyncClient(timeout=15) as http:
-        if fxcm_enabled():
-            offers = await fxcm_offers(http)
-            available = {symbol.upper(): symbol for symbol in offers}
-            for candidate in fxcm_symbol_candidates(asset):
+        if oanda_enabled():
+            available = {name.upper(): name for name in await oanda_instruments(http)}
+            for candidate in oanda_symbol_candidates(asset):
                 symbol = available.get(candidate.upper())
                 if symbol:
-                    return {"provider": "fxcm", "symbol": symbol}
+                    return {"provider": "oanda", "symbol": symbol}
 
         resolved = await resolve_bybit_symbol(http, asset)
         if resolved:
@@ -611,14 +624,26 @@ async def resolve_market(asset: str) -> Optional[dict]:
 
 
 async def fetch_trade_price(
-    http: httpx.AsyncClient, trade: dict, offers: dict[str, float]
+    http: httpx.AsyncClient, trade: dict, quotes: dict[str, float]
 ) -> Optional[float]:
-    """Current price for a monitored trade, from whichever provider owns it."""
-    if trade.get("provider") == "fxcm":
-        return offers.get(trade["symbol"])
-    return await fetch_bybit_price(
-        http, trade["symbol"], trade.get("category", "linear")
+    """Current price for a monitored trade, from whichever provider owns it.
+
+    OANDA prices arrive pre-fetched for the whole cycle; Bybit is queried per
+    symbol. An unknown provider yields None, so the trade is skipped rather
+    than priced against the wrong market.
+    """
+    provider = trade.get("provider", "bybit")
+    if provider == "oanda":
+        return quotes.get(trade["symbol"])
+    if provider == "bybit":
+        return await fetch_bybit_price(
+            http, trade["symbol"], trade.get("category", "linear")
+        )
+    logger.warning(
+        "Trade on %s uses retired provider %r — it will expire on its own",
+        trade.get("asset"), provider,
     )
+    return None
 
 
 def check_trade(trade: dict, price: float) -> Optional[str]:
@@ -719,11 +744,9 @@ async def monitor_trades(context: ContextTypes.DEFAULT_TYPE) -> None:
     now = datetime.now(dt_timezone.utc)
 
     async with httpx.AsyncClient(timeout=15) as http:
-        # One FXCM snapshot covers every FXCM-priced trade this cycle
-        offers = (
-            await fxcm_offers(http)
-            if any(t.get("provider") == "fxcm" for t in trades)
-            else {}
+        # One OANDA request prices every OANDA-backed trade this cycle
+        quotes = await oanda_prices(
+            http, {t["symbol"] for t in trades if t.get("provider") == "oanda"}
         )
 
         for trade in list(trades):
@@ -740,7 +763,7 @@ async def monitor_trades(context: ContextTypes.DEFAULT_TYPE) -> None:
                 )
                 continue
 
-            price = await fetch_trade_price(http, trade, offers)
+            price = await fetch_trade_price(http, trade, quotes)
             if price is None:
                 continue
 
@@ -1039,11 +1062,11 @@ async def handle_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
         await message.reply_text(build_signal_message(data))
 
-        # Register the trade for live monitoring (FXCM, or Bybit for crypto)
+        # Register the trade for live monitoring (OANDA, or Bybit for crypto)
         market = await resolve_market(data.asset)
         if not market:
-            hint = "" if fxcm_enabled() else (
-                " Set FXCM_ACCESS_TOKEN to enable forex, metals and indices."
+            hint = "" if oanda_enabled() else (
+                " Set OANDA_ACCESS_TOKEN to enable forex, metals and indices."
             )
             await message.reply_text(
                 f"ℹ️ Live monitoring isn't available for {data.asset.upper()} "
@@ -1179,8 +1202,8 @@ def main() -> None:
     )
     logger.info(
         "Live prices: %s",
-        f"FXCM ({FXCM_HOST}) with Bybit fallback" if fxcm_enabled()
-        else "Bybit only — set FXCM_ACCESS_TOKEN for forex/metals/indices",
+        f"OANDA ({OANDA_HOST}) with Bybit fallback" if oanda_enabled()
+        else "Bybit only — set OANDA_ACCESS_TOKEN for forex/metals/indices",
     )
 
     # On Render (and similar hosts) RENDER_EXTERNAL_URL is set automatically:
