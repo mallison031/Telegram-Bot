@@ -93,11 +93,34 @@ BYBIT_CATEGORIES = ("linear", "spot")
 
 # Tried in order — first one that responds wins. The newest Flash models on the
 # free tier intermittently return 503 (high demand), so we keep fallbacks.
+# Order is by observed availability, not preference: on the free tier the
+# first two have been serving steady 503s while the third answers, and every
+# dead model tried first adds ~8s to the user's wait. All three stay in the
+# list so the bot rides out whichever one is busy on a given day.
 GEMINI_MODELS = [
-    "gemini-3.5-flash",
-    "gemini-flash-latest",
     "gemini-3-flash-preview",
+    "gemini-flash-latest",
+    "gemini-3.5-flash",
 ]
+
+# When every model is busy the whole list is retried after a pause. Free-tier
+# 503s are explicitly temporary ("spikes in demand are usually temporary"), so
+# waiting a few seconds usually beats failing the user's chart outright.
+GEMINI_BACKOFF = (0, 4, 10)
+# Never spend longer than this on one image, so a reply always arrives
+GEMINI_MAX_WAIT = 75
+
+# Errors worth retrying: overloaded, rate-limited, or a transient server fault
+GEMINI_RETRY_CODES = (429, 500, 502, 503, 504)
+
+
+def is_retryable(error: Exception) -> bool:
+    """True if this Gemini failure is transient and worth another attempt."""
+    code = getattr(error, "code", None) or getattr(error, "status_code", None)
+    if isinstance(code, int):
+        return code in GEMINI_RETRY_CODES
+    text = str(error)
+    return any(str(c) in text for c in GEMINI_RETRY_CODES) or "UNAVAILABLE" in text
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -227,29 +250,54 @@ def extract_chart_analysis(image_bytes: bytes, mime_type: str) -> ChartAnalysis:
     Tries each model in GEMINI_MODELS until one responds — free-tier models
     intermittently return 503 (high demand) or 429 (quota).
     """
+    deadline = time.monotonic() + GEMINI_MAX_WAIT
     last_error: Exception | None = None
-    for model in GEMINI_MODELS:
-        try:
-            response = gemini_client.models.generate_content(
-                model=model,
-                contents=[
-                    genai_types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
-                    VISION_PROMPT,
-                ],
-                config=genai_types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=ChartAnalysis,
-                    temperature=0,
-                ),
-            )
-        except Exception as error:  # noqa: BLE001 - fall through to next model
-            logger.warning("Model %s failed: %s", model, error)
-            last_error = error
-            continue
-        parsed = response.parsed
-        if isinstance(parsed, ChartAnalysis):
-            return parsed
-        return ChartAnalysis.model_validate_json(response.text)
+
+    for attempt, delay in enumerate(GEMINI_BACKOFF):
+        if delay:
+            if time.monotonic() + delay >= deadline:
+                break
+            logger.info("All models busy, retrying in %ss", delay)
+            time.sleep(delay)
+
+        for model in GEMINI_MODELS:
+            try:
+                response = gemini_client.models.generate_content(
+                    model=model,
+                    contents=[
+                        genai_types.Part.from_bytes(
+                            data=image_bytes, mime_type=mime_type
+                        ),
+                        VISION_PROMPT,
+                    ],
+                    config=genai_types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=ChartAnalysis,
+                        temperature=0,
+                    ),
+                )
+            except Exception as error:  # noqa: BLE001 - try the next model
+                last_error = error
+                if not is_retryable(error):
+                    # A bad key or malformed request won't fix itself
+                    logger.error("Model %s failed permanently: %s", model, error)
+                    raise
+                logger.warning("Model %s busy (attempt %d): %s",
+                               model, attempt + 1, error)
+                if time.monotonic() >= deadline:
+                    break
+                continue
+
+            if attempt:
+                logger.info("Model %s answered on attempt %d", model, attempt + 1)
+            parsed = response.parsed
+            if isinstance(parsed, ChartAnalysis):
+                return parsed
+            return ChartAnalysis.model_validate_json(response.text)
+
+        if time.monotonic() >= deadline:
+            break
+
     raise last_error if last_error else RuntimeError("No Gemini model available")
 
 
@@ -1177,11 +1225,18 @@ async def handle_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 f"{be_price:.{decimals}f} (30% of the way to TP), and again "
                 f"when TP or SL is hit.{cadence}"
             )
-    except Exception:
+    except Exception as error:
         logger.exception("Failed to process chart")
-        await message.reply_text(
-            "❌ Sorry, I couldn't process that image right now. Please try again."
-        )
+        if is_retryable(error):
+            await message.reply_text(
+                "⏳ The vision AI is overloaded right now (free tier). I kept "
+                "retrying for a while and it stayed busy — send the chart "
+                "again in a minute and it usually goes through."
+            )
+        else:
+            await message.reply_text(
+                "❌ Sorry, I couldn't process that image right now. Please try again."
+            )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
