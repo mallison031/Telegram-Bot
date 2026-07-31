@@ -111,17 +111,20 @@ The command menu is registered with Telegram automatically at startup.
 | --- | --- | --- |
 | Instruments | Provider | Update rate | Needs |
 | --- | --- | --- | --- |
-| Gold and silver (XAUUSD, XAGUSD), Forex, Indices, Oil | Yahoo Finance | every 60 s | nothing |
-| Crypto (BTCUSD, ETHUSD, SOLUSD…) | Bybit | every 60 s | nothing |
+| Spot Gold & Silver (`XAUUSD`, `XAGUSD`) | GoldAPI (`gold-api.com`) | every 60 s | nothing |
+| Forex, Indices, Oil (`EURUSD`, `US30`, `USOIL`…) | Yahoo Finance | every 60 s | nothing |
+| Crypto (`BTCUSD`, `ETHUSD`, `SOLUSD`…) | Bybit | every 60 s | nothing |
 
 The providers work together automatically with **zero required broker credentials or API keys**:
-- **Yahoo Finance** is checked first for traditional markets, covering gold (`XAUUSD`), silver (`XAGUSD`), forex pairs, major stock indices (`US30`, `US500`, `US100`, `GER40`), and oil (`USOIL`, `UKOIL`).
-- **Bybit** is keyless and unmetered, handling crypto (`BTCUSD`, `ETHUSD`...).
+- **GoldAPI** is checked first for spot metals (`XAUUSD` -> `XAU`, `XAGUSD` -> `XAG`). This uses real-time spot prices rather than COMEX futures so your Stop Loss and Take Profit levels match spot CFD broker charts exactly.
+- **Yahoo Finance** is checked next for traditional markets, covering forex pairs (`EURUSD=X`), major stock indices (`^DJI`, `^GSPC`, `^IXIC`, `^GDAXI`), and oil (`CL=F`, `BZ=F`).
+- **Bybit** is keyless and unmetered, handling crypto (`BTCUSD`, `ETHUSD`...) and spot CFD fallbacks.
 - Charts neither provider carries still get a signal; they just don't get breakeven/TP/SL alerts.
 
 #### How a chart maps to a market symbol
 
-- For traditional assets, the bot maps chart tickers directly to public Yahoo Finance symbols (e.g. `XAUUSD` -> `GC=F`, `XAGUSD` -> `SI=F`, `US30` -> `^DJI`, `EURUSD` -> `EURUSD=X`).
+- For spot metals, the bot maps `XAUUSD`/`GOLD` to `XAU` and `XAGUSD`/`SILVER` to `XAG` on `gold-api.com`.
+- For other traditional assets, the bot maps chart tickers to public Yahoo Finance symbols (e.g. `US30` -> `^DJI`, `EURUSD` -> `EURUSD=X`).
 - For crypto, Bybit names pairs its own way: a chart labelled `BTCUSD` is `BTCUSDT` there. Rather than guess a suffix, the bot probes Bybit's API to confirm the live ticker exists.
 
 ## How it works

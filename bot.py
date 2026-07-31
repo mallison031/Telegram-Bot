@@ -523,10 +523,48 @@ async def fetch_bybit_price(
     except (KeyError, ValueError):
         return None
 # ---------------------------------------------------------------------------
+# Live prices: Gold API (public spot metals — keyless, no account needed)
+#
+# Covers real spot gold (XAUUSD -> XAU) and spot silver (XAGUSD -> XAG).
+# Free, unmetered public JSON API: https://api.gold-api.com/price/{symbol}
+# ---------------------------------------------------------------------------
+
+GOLDAPI_BASE_URL = "https://api.gold-api.com/price"
+
+
+def goldapi_symbol_candidates(asset: str) -> list[str]:
+    compact = normalize_asset(asset)
+    if compact in ("XAUUSD", "GOLD", "XAU"):
+        return ["XAU"]
+    if compact in ("XAGUSD", "SILVER", "XAG"):
+        return ["XAG"]
+    return []
+
+
+async def fetch_goldapi_price(
+    http: httpx.AsyncClient, symbol: str
+) -> Optional[float]:
+    """Current spot price for XAU (Gold) or XAG (Silver) from gold-api.com."""
+    try:
+        response = await http.get(
+            f"{GOLDAPI_BASE_URL}/{symbol.upper()}",
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        if response.status_code != 200:
+            return None
+        payload = response.json()
+        price = float(payload["price"])
+        return price if price > 0 else None
+    except (httpx.HTTPError, KeyError, ValueError, TypeError) as error:
+        logger.warning("GoldAPI price check failed for %s: %s", symbol, error)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Live prices: Yahoo Finance (public market data — keyless, no account needed)
 #
 # Covers forex pairs (EURUSD=X), indices (^DJI, ^GSPC, ^IXIC, ^GDAXI, ^FTSE),
-# commodities/oil (CL=F, BZ=F, GC=F, SI=F), and crypto (BTC-USD, ETH-USD...).
+# and commodities/oil (CL=F, BZ=F).
 # ---------------------------------------------------------------------------
 
 def yahoo_symbol_candidates(asset: str) -> list[str]:
@@ -543,8 +581,6 @@ def yahoo_symbol_candidates(asset: str) -> list[str]:
         "UK100": "^FTSE", "FTSE": "^FTSE",
         "USOIL": "CL=F", "WTI": "CL=F",
         "UKOIL": "BZ=F", "BRENT": "BZ=F",
-        "XAUUSD": "GC=F", "GOLD": "GC=F",
-        "XAGUSD": "SI=F", "SILVER": "SI=F",
     }
     if compact in index_map:
         candidates.append(index_map[compact])
@@ -590,11 +626,15 @@ async def fetch_yahoo_price(
 async def resolve_market(asset: str) -> Optional[dict]:
     """Pick where to source live prices for a charted asset.
 
-    Yahoo Finance goes first for traditional markets: Gold/Silver (XAUUSD, XAGUSD),
-    forex pairs, stock indices, and oil.
+    GoldAPI goes first for spot metals: Gold/Silver (XAUUSD, XAGUSD).
+    Yahoo Finance goes next for traditional markets: forex pairs, stock indices, and oil.
     Bybit goes next: it covers crypto (BTCUSD, ETHUSD, SOLUSD...).
     """
     async with httpx.AsyncClient(timeout=20) as http:
+        for candidate in goldapi_symbol_candidates(asset):
+            if await fetch_goldapi_price(http, candidate) is not None:
+                return {"provider": "goldapi", "symbol": candidate}
+
         for candidate in yahoo_symbol_candidates(asset):
             if await fetch_yahoo_price(http, candidate) is not None:
                 return {"provider": "yahoo", "symbol": candidate}
@@ -624,6 +664,8 @@ async def fetch_trade_price(
         return await fetch_bybit_price(
             http, trade["symbol"], trade.get("category", "linear")
         )
+    if provider == "goldapi":
+        return await fetch_goldapi_price(http, trade["symbol"])
     if provider == "yahoo":
         return await fetch_yahoo_price(http, trade["symbol"])
     logger.warning(
@@ -744,6 +786,12 @@ async def monitor_trades(context: ContextTypes.DEFAULT_TYPE) -> None:
                     "still valid.",
                 )
                 continue
+
+            # Self-healing: upgrade any legacy futures gold/silver trade to spot metals
+            if trade.get("provider") == "yahoo" and trade.get("symbol") in ("GC=F", "SI=F"):
+                trade["provider"] = "goldapi"
+                trade["symbol"] = "XAU" if trade["symbol"] == "GC=F" else "XAG"
+                save_state()
 
             price = await fetch_trade_price(http, trade)
             if price is None:
@@ -1188,7 +1236,7 @@ def main() -> None:
         MORNING_HOUR, NIGHT_HOUR, tz.key,
         datetime.now(tz).strftime("%Y-%m-%d %H:%M"),
     )
-    logger.info("Live prices: Yahoo Finance (traditional markets) + Bybit (crypto)")
+    logger.info("Live prices: GoldAPI (spot metals) + Yahoo Finance (forex/indices/oil) + Bybit (crypto)")
 
     # On Render (and similar hosts) RENDER_EXTERNAL_URL is set automatically:
     # run in webhook mode so incoming Telegram messages wake the free service.
