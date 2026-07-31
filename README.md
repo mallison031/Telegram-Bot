@@ -88,10 +88,10 @@ drawn on it — you'll get the formatted signal back in a few seconds.
   register the trade twice, and monitoring stops on its own after
   `TRADE_TTL_HOURS` (default 72) if nothing has resolved.
 - **Morning and night motivation** — a fresh Gemini-written text each day at
-  `MORNING_HOUR` (default 8:00) and `NIGHT_HOUR` (default 22:00), in
-  `TIMEZONE`, to every chat that has used the bot. The morning text is a
-  plan-your-day nudge; the night one is a wind-down (journal your trades, no
-  revenge trading, rest).
+  `MORNING_HOUR` (default 8:00) and `NIGHT_HOUR` (default 20:00), in
+  `TIMEZONE` (default `Africa/Lagos` / West Africa Time), to every chat that
+  has used the bot. The morning text is a plan-your-day nudge; the night one is a
+  wind-down (journal your trades, no revenge trading, rest).
 
 ### Commands
 
@@ -326,7 +326,7 @@ service uses ~730 of the free plan's 750 instance-hours per month, so it fits.
 2. **Is `TIMEZONE` set on the host?** Unset means UTC — an 8:00 text lands at
    9:00 in Lagos, 4:00 in New York. The startup log prints the resolved
    timezone and the local time, e.g.
-   `Motivation texts: morning 08:00, night 22:00 (Africa/Lagos, now ...)`.
+   `Motivation texts: morning 08:00, night 20:00 (Africa/Lagos, now ...)`.
 3. **Was the service awake?** A sleeping free-tier service runs no jobs at all.
    The bot now catches up on a text it missed while asleep (up to 6 hours
    late), but it can only do that once it wakes — set up the uptime pinger

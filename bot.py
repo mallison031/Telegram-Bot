@@ -56,9 +56,9 @@ TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
 # Optional settings
-TIMEZONE = os.environ.get("TIMEZONE", "UTC")
-MORNING_HOUR = int(os.environ.get("MORNING_HOUR", "8"))
-NIGHT_HOUR = int(os.environ.get("NIGHT_HOUR", "22"))
+TIMEZONE = os.environ.get("TIMEZONE", "Africa/Lagos")  # West Africa Time (WAT)
+MORNING_HOUR = int(os.environ.get("MORNING_HOUR", "8"))   # 8:00 AM WAT
+NIGHT_HOUR = int(os.environ.get("NIGHT_HOUR", "20"))      # 8:00 PM WAT (20:00)
 STATE_FILE = Path(os.environ.get("STATE_FILE", "state.json"))
 
 # Twelve Data supplies forex prices, which Bybit does not list. Get a free key
@@ -82,7 +82,7 @@ MARKET_ORDER_TOLERANCE = 0.0005
 DUPLICATE_TOLERANCE = 0.001
 
 # How often to check whether a scheduled text is due (seconds)
-SCHEDULE_INTERVAL = 300
+SCHEDULE_INTERVAL = 30
 # A scheduled text more than this many hours late is dropped rather than sent
 # at a nonsensical time (e.g. the morning text arriving at 6pm).
 CATCHUP_HOURS = 6
