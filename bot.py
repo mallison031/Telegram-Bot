@@ -50,6 +50,8 @@ from telegram.ext import (
     filters,
 )
 
+from broker_api import broker_execution_enabled, execute_broker_order
+
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -1129,6 +1131,22 @@ async def handle_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         })
         save_state()
 
+        exec_note = ""
+        if broker_execution_enabled():
+            success, exec_msg = await execute_broker_order({
+                "asset": data.asset.upper(),
+                "symbol": symbol,
+                "direction": data.direction,
+                "entry": data.entry,
+                "sl": data.stop_loss,
+                "tp": data.take_profit,
+            })
+            exec_note = (
+                f"\n\n⚡ Broker Execution: {exec_msg}"
+                if success
+                else f"\n\n⚠️ Broker Execution: {exec_msg}"
+            )
+
         cadence = ""
 
         if fill:
@@ -1140,14 +1158,14 @@ async def handle_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 f"🔔 Pending order registered. I'll tell you when price "
                 f"reaches your entry at {data.entry:.{decimals}f}, then watch "
                 f"for breakeven ({be_price:.{decimals}f}), TP and SL."
-                f"{expiry}{cadence}"
+                f"{expiry}{cadence}{exec_note}"
             )
         else:
             await message.reply_text(
                 f"🔔 Trade is being monitored live.\n"
                 f"I'll alert you to move SL to breakeven at "
                 f"{be_price:.{decimals}f} (30% of the way to TP), and again "
-                f"when TP or SL is hit.{cadence}"
+                f"when TP or SL is hit.{cadence}{exec_note}"
             )
     except Exception as error:
         logger.exception("Failed to process chart")

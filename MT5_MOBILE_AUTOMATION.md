@@ -108,12 +108,13 @@ graph TD
 
 | Option | Status | Selected | Next Action |
 | --- | --- | --- | --- |
-| **Option 1: Self-Hosted MQL5 EA** | Proposed | ⏳ Pending User Choice | Write MQL5 Expert Advisor template and VPS setup guide. |
-| **Option 2: Direct Broker REST API** | Proposed | ⏳ Pending User Choice | Confirm broker name & API availability. |
-| **Option 3: Assisted Mobile Buttons** | Proposed | ⏳ Pending User Choice | Add Telegram Inline Keyboard to signal cards. |
+| **Option 1: Self-Hosted MQL5 EA** | Archived | ❌ No | — |
+| **Option 2: Direct Broker REST API** | In Progress | ✅ **SELECTED** | Identify user's broker & build `broker_api.py` execution module. |
+| **Option 3: Assisted Mobile Buttons** | Archived | ❌ No | — |
 
 ---
 
 ## 4. Documentation Log
 
+- **2026-07-31 (15:06 WAT):** User explicitly selected **Option 2 (Direct Broker REST API)** for automated Mobile MT5 trade execution. This eliminates the need for any local desktop computer or cloud VPS while maintaining 100% security via trade-only REST API keys.
 - **2026-07-31:** Created initial architecture document comparing Mobile MT5 execution strategies without third-party credential bridges or local PC dependency.
