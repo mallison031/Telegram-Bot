@@ -1285,8 +1285,6 @@ async def handle_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 f"\n⏱ Forex prices are checked about every {minutes:.0f} min "
                 "(free data plan), so alerts can be that late."
             )
-        elif market["provider"] == "yahoo":
-            cadence = "\n📡 Monitored live via Yahoo Finance (free public market data)."
 
         if fill:
             expiry = (
