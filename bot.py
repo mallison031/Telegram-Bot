@@ -11,7 +11,8 @@ trusting the AI with math), and replies with a formatted signal:
     Profit: +[X]% / Loss: -[Y]%
 
 Extra features:
-- Live trade monitoring (Bybit for crypto and gold, Twelve Data for forex):
+- Live trade monitoring (Yahoo Finance for forex/indices/oil/metals, Bybit for
+  crypto and gold, Twelve Data for forex fallback):
   alerts when a pending order fills, when to move SL to breakeven once price
   covers 30% of the distance to TP, and a motivation message on TP or SL.
   Chart assets are matched against each provider's real instrument list
@@ -680,16 +681,83 @@ async def twelvedata_prices(
 
 
 # ---------------------------------------------------------------------------
-# Provider routing: Bybit for crypto and gold, Twelve Data for forex
+# Live prices: Yahoo Finance (public market data — keyless, no account needed)
+#
+# Covers forex pairs (EURUSD=X), indices (^DJI, ^GSPC, ^IXIC, ^GDAXI, ^FTSE),
+# commodities/oil (CL=F, BZ=F, GC=F, SI=F), and crypto (BTC-USD, ETH-USD...).
+# ---------------------------------------------------------------------------
+
+def yahoo_symbol_candidates(asset: str) -> list[str]:
+    """Yahoo Finance symbol names to try for an asset like 'EURUSD' or 'US30'."""
+    compact = normalize_asset(asset)
+    candidates = []
+
+    # Indices & Commodities
+    index_map = {
+        "US30": "^DJI", "DJI": "^DJI", "DOW": "^DJI",
+        "US500": "^GSPC", "SPX500": "^GSPC", "SPX": "^GSPC", "SP500": "^GSPC",
+        "US100": "^IXIC", "NAS100": "^IXIC", "NASDAQ": "^IXIC",
+        "GER40": "^GDAXI", "GER30": "^GDAXI", "DAX": "^GDAXI",
+        "UK100": "^FTSE", "FTSE": "^FTSE",
+        "USOIL": "CL=F", "WTI": "CL=F",
+        "UKOIL": "BZ=F", "BRENT": "BZ=F",
+        "XAUUSD": "GC=F", "GOLD": "GC=F",
+        "XAGUSD": "SI=F", "SILVER": "SI=F",
+    }
+    if compact in index_map:
+        candidates.append(index_map[compact])
+
+    # Forex pairs (e.g., EURUSD -> EURUSD=X)
+    if len(compact) == 6 and compact.isalpha():
+        candidates.append(f"{compact}=X")
+
+    # Try raw as a fallback
+    candidates.append(asset.strip())
+
+    return list(dict.fromkeys(candidates))
+
+
+async def fetch_yahoo_price(
+    http: httpx.AsyncClient, symbol: str
+) -> Optional[float]:
+    """Current regularMarketPrice for a Yahoo Finance symbol, or None if unavailable."""
+    url = f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}"
+    try:
+        r = await http.get(
+            url,
+            params={"interval": "1m", "range": "1d"},
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        meta = data["chart"]["result"][0]["meta"]
+        price = meta.get("regularMarketPrice")
+        if price is not None:
+            price = float(price)
+            return price if price > 0 else None
+    except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError):
+        return None
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Provider routing: Yahoo Finance for metals/forex/indices/oil, Bybit for crypto
 # ---------------------------------------------------------------------------
 
 async def resolve_market(asset: str) -> Optional[dict]:
     """Pick where to source live prices for a charted asset.
 
-    Bybit goes first: it is keyless, unmetered and covers crypto plus gold.
-    Twelve Data picks up forex, which Bybit does not list at all.
+    Yahoo Finance goes first for traditional markets: Gold/Silver (XAUUSD, XAGUSD),
+    forex pairs, stock indices, and oil.
+    Bybit goes next: it covers crypto (BTCUSD, ETHUSD, SOLUSD...).
+    Twelve Data acts as an optional fallback for any remaining forex pairs.
     """
     async with httpx.AsyncClient(timeout=20) as http:
+        for candidate in yahoo_symbol_candidates(asset):
+            if await fetch_yahoo_price(http, candidate) is not None:
+                return {"provider": "yahoo", "symbol": candidate}
+
         # Ask Bybit about each candidate directly rather than downloading the
         # whole ticker table. The full linear list is ~550KB and takes ~9s on
         # a good connection, which times out on a free-tier host and silently
@@ -717,10 +785,10 @@ async def fetch_trade_price(
 ) -> Optional[float]:
     """Current price for a monitored trade.
 
-    Twelve Data prices arrive pre-fetched for the whole cycle; Bybit is
-    queried per symbol. Trades registered against a provider that has since
-    been removed yield None, so they are skipped rather than priced against
-    the wrong market, and the TTL retires them on its own.
+    Twelve Data prices arrive pre-fetched for the whole cycle; Bybit and
+    Yahoo Finance are queried per symbol. Trades registered against a provider
+    that has since been removed yield None, so they are skipped rather than
+    priced against the wrong market, and the TTL retires them on its own.
     """
     provider = trade.get("provider", "bybit")
     if provider == "bybit":
@@ -729,6 +797,8 @@ async def fetch_trade_price(
         )
     if provider == "twelvedata":
         return quotes.get(trade["symbol"])
+    if provider == "yahoo":
+        return await fetch_yahoo_price(http, trade["symbol"])
     logger.warning(
         "Trade on %s uses retired provider %r — it will expire on its own",
         trade.get("asset"), provider,
@@ -1215,6 +1285,8 @@ async def handle_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 f"\n⏱ Forex prices are checked about every {minutes:.0f} min "
                 "(free data plan), so alerts can be that late."
             )
+        elif market["provider"] == "yahoo":
+            cadence = "\n📡 Monitored live via Yahoo Finance (free public market data)."
 
         if fill:
             expiry = (

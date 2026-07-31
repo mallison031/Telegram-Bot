@@ -111,16 +111,15 @@ The command menu is registered with Telegram automatically at startup.
 | --- | --- | --- |
 | Instruments | Provider | Update rate | Needs |
 | --- | --- | --- | --- |
+| Gold and silver (XAUUSD, XAGUSD), Forex, Indices, Oil | Yahoo Finance | every 60 s | nothing |
 | Crypto (BTCUSD, ETHUSD, SOLUSD…) | Bybit | every 60 s | nothing |
-| Gold and silver (XAUUSD, XAGUSD) | Bybit | every 60 s | nothing |
-| Forex (EURUSD, GBPUSD, USDJPY…) | Twelve Data | every 2–6 min | `TWELVEDATA_API_KEY` |
-| Stock indices, oil | — | not monitored | — |
+| Forex fallback (EURUSD, GBPUSD…) | Twelve Data | every 2–6 min | `TWELVEDATA_API_KEY` (optional) |
 
-The two providers are used together, each for what it does best. Bybit is
-keyless and unmetered, so it handles everything it lists — all crypto plus
-gold and silver. Twelve Data fills the one gap that matters, forex, which
-Bybit does not list at all. Charts neither provider carries still get a
-signal; they just don't get breakeven/TP/SL alerts.
+The providers work together automatically with **zero required broker credentials or API keys**:
+- **Yahoo Finance** is checked first for traditional markets, covering gold (`XAUUSD`), silver (`XAGUSD`), forex pairs, major stock indices (`US30`, `US500`, `US100`, `GER40`), and oil (`USOIL`, `UKOIL`).
+- **Bybit** is keyless and unmetered, handling crypto (`BTCUSD`, `ETHUSD`...).
+- **Twelve Data** acts as an optional fallback for any forex pair not caught by Yahoo Finance.
+- Charts neither provider carries still get a signal; they just don't get breakeven/TP/SL alerts.
 
 #### Forex polling and the free credit budget
 
