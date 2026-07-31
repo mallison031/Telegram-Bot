@@ -736,23 +736,15 @@ SL_MESSAGES = [
 ]
 
 FALLBACK_MORNING = [
-    "🌅 Good morning, trader! Plan your trades, trade your plan. Discipline "
-    "today compounds into freedom tomorrow. 📈",
-    "🌅 Morning! Remember: you don't have to catch every move — you only have "
-    "to catch YOUR setup. Patience is a position too. 💪",
-    "🌅 Rise and grind! Risk management first, profits second. Protect your "
-    "capital and the wins will follow. 🚀",
+    "🌅 Good morning! Plan your trade, trade your plan, and manage your risk.",
+    "🌅 Morning trader! Patience is a position — wait for your A+ setup.",
+    "🌅 Rise and shine! Protect your capital first, profits will follow.",
 ]
 
 FALLBACK_NIGHT = [
-    "🌙 Markets close, the work doesn't. Journal today's trades — what you "
-    "did right matters as much as what you'd change. Rest well; a sharp mind "
-    "is your real edge. 😴",
-    "🌙 Day's done. Green or red, you followed a process — that's the part "
-    "you control. Screens off, review tomorrow with fresh eyes. 🧠",
-    "🌙 Wrap it up for today. No revenge trades, no late-night chasing. The "
-    "market will hand out new setups tomorrow, and you'll be rested for "
-    "them. 🌟",
+    "🌙 Day's done! Journal your trades, step away from charts, and get rest.",
+    "🌙 Markets will wait. No revenge trading — rest up for tomorrow's session.",
+    "🌙 Wrap up for the day! A well-rested mind is your best trading edge.",
 ]
 
 
@@ -851,17 +843,14 @@ async def monitor_trades(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 SCHEDULE_PROMPTS = {
     "morning": (
-        "Write a short, energetic good-morning motivation message for a day "
-        "trader. 2-3 sentences, include one practical reminder about discipline "
-        "or risk management, a couple of fitting emojis, no hashtags, no "
-        "preamble — output the message text only."
+        "Write 1 short, simple morning motivation sentence for a day trader "
+        "(maximum 15 words). Focus on discipline or risk management, include "
+        "one emoji, no hashtags, no preamble — output the sentence text only."
     ),
     "night": (
-        "Write a short, calm end-of-day message for a day trader who is "
-        "finishing their trading session. 2-3 sentences: encourage them to "
-        "review or journal today's trades, discourage revenge trading, and "
-        "remind them that rest sharpens judgement. A couple of fitting emojis, "
-        "no hashtags, no preamble — output the message text only."
+        "Write 1 short, simple evening wind-down sentence for a day trader "
+        "(maximum 15 words). Encourage rest or journaling, no revenge trading, "
+        "include one emoji, no hashtags, no preamble — output the sentence text only."
     ),
 }
 
