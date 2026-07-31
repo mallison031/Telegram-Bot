@@ -26,6 +26,7 @@ BROKER_API_KEY = os.environ.get("BROKER_API_KEY", "").strip()
 BROKER_API_SECRET = os.environ.get("BROKER_API_SECRET", "").strip()
 BROKER_ACCOUNT_ID = os.environ.get("BROKER_ACCOUNT_ID", "").strip()
 BROKER_WEBHOOK_URL = os.environ.get("BROKER_WEBHOOK_URL", "").strip()
+EXNESS_SYMBOL_SUFFIX = os.environ.get("EXNESS_SYMBOL_SUFFIX", "").strip()  # e.g., 'm' for Exness Standard, 'c' for Cent, '' for Pro/Raw
 
 
 def broker_execution_enabled() -> bool:
@@ -34,7 +35,7 @@ def broker_execution_enabled() -> bool:
         return False
     if BROKER_PROVIDER in ("bybit", "oanda"):
         return bool(BROKER_API_KEY and (BROKER_API_SECRET or BROKER_ACCOUNT_ID))
-    if BROKER_PROVIDER == "webhook":
+    if BROKER_PROVIDER in ("webhook", "exness", "exness_webhook"):
         return bool(BROKER_WEBHOOK_URL)
     return False
 
@@ -178,6 +179,49 @@ async def execute_webhook_order(
         return False, f"Webhook request failed: {error}"
 
 
+async def execute_exness_order(
+    http: httpx.AsyncClient, trade_spec: dict
+) -> tuple[bool, str]:
+    """Execute/forward an order to an Exness Webhook / REST Terminal endpoint.
+
+    Supports Exness MT5 symbol suffixes (e.g. 'm' for Standard accounts, 'c' for Cent accounts).
+    """
+    if not BROKER_WEBHOOK_URL:
+        return False, "BROKER_WEBHOOK_URL is not configured for Exness"
+
+    symbol = trade_spec.get("symbol", trade_spec["asset"]).strip().upper()
+    if EXNESS_SYMBOL_SUFFIX and not symbol.endswith(EXNESS_SYMBOL_SUFFIX.upper()) and not symbol.endswith(EXNESS_SYMBOL_SUFFIX.lower()):
+        symbol = f"{symbol}{EXNESS_SYMBOL_SUFFIX}"
+
+    action = "BUY" if trade_spec["direction"] == "LONG" else "SELL"
+
+    payload = {
+        "broker": "exness",
+        "symbol": symbol,
+        "action": action,
+        "order_type": "LIMIT",
+        "price": trade_spec["entry"],
+        "sl": trade_spec["sl"],
+        "tp": trade_spec["tp"],
+        "volume": trade_spec.get("lot_size", 0.01),
+        "comment": "TelegramBot_AI_Signal",
+    }
+
+    headers = {"Content-Type": "application/json"}
+    if BROKER_API_KEY:
+        headers["Authorization"] = f"Bearer {BROKER_API_KEY}"
+        headers["X-API-KEY"] = BROKER_API_KEY
+
+    try:
+        response = await http.post(BROKER_WEBHOOK_URL, json=payload, headers=headers)
+        if response.status_code in (200, 201, 202, 204):
+            return True, f"Exness Order Sent ({symbol} {action} @ {trade_spec['entry']})"
+        return False, f"Exness Webhook Error HTTP {response.status_code}: {response.text[:100]}"
+    except Exception as error:
+        logger.exception("Exness order execution failed: %s", error)
+        return False, f"Exness request failed: {error}"
+
+
 async def execute_broker_order(trade_spec: dict) -> tuple[bool, str]:
     """Route an order to the configured broker REST API provider.
 
@@ -192,6 +236,8 @@ async def execute_broker_order(trade_spec: dict) -> tuple[bool, str]:
             return await execute_bybit_order(http, trade_spec)
         if BROKER_PROVIDER == "oanda":
             return await execute_oanda_order(http, trade_spec)
+        if BROKER_PROVIDER in ("exness", "exness_webhook"):
+            return await execute_exness_order(http, trade_spec)
         if BROKER_PROVIDER == "webhook":
             return await execute_webhook_order(http, trade_spec)
 

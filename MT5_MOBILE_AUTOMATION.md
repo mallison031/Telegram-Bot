@@ -81,10 +81,10 @@ graph TD
 - **Restricted Token Scope:** API tokens cannot withdraw funds.
 
 #### Implementation Steps
-- [ ] Identify broker API documentation and authentication mechanism.
-- [ ] Create `broker_api.py` helper in this repository to wrap order execution calls.
-- [ ] Add environment variables for API Key/Secret to `.env.example` and `render.yaml`.
-- [ ] Integrate automatic execution into `bot.py`'s `handle_chart` pipeline.
+- [x] Identify broker API documentation and authentication mechanism (Exness Webhook/REST API + symbol suffix formatting).
+- [x] Create `broker_api.py` helper in this repository to wrap order execution calls (`execute_exness_order`).
+- [x] Add environment variables (`BROKER_PROVIDER=exness`, `BROKER_WEBHOOK_URL`, `EXNESS_SYMBOL_SUFFIX`) to `.env.example`.
+- [x] Integrate automatic execution into `bot.py`'s `handle_chart` pipeline.
 
 ---
 
