@@ -80,9 +80,16 @@ drawn on it — you'll get the formatted signal back in a few seconds.
 
 - **Chart signals** — send a chart screenshot, get the formatted signal back.
 - **The most recent position wins** — charts usually carry several position
-  tools from earlier setups. The bot reads the **right-most** one (time runs
-  left to right, so the right-most tool is the newest) and ignores the rest.
-  When it sees more than one, it says so, in case you meant a different one.
+  tools from earlier setups. The bot reads the **newest** one, judged by which
+  tool's box *starts* furthest right on the time axis, and ignores the rest.
+  Recency is judged by where a tool starts, not how far right it reaches, so
+  an older position still running to the right edge doesn't win. When it sees
+  more than one, it says so, in case you meant a different one.
+- **Running trades are called out** — if another position on the chart is
+  already live (price has passed its entry and is travelling between entry and
+  TP/SL), the bot tells you it's running and gives its levels, on top of the
+  signal for the most recent setup. That one is *not* monitored — send it as
+  its own chart if you want alerts for it too.
 - **Market execution vs pending order** — the bot fetches the **live price**
   and compares it to your entry. Entry sitting on the market is a market
   execution (`BUY MARKET` / `SELL MARKET`), monitored as already open. Entry
@@ -156,8 +163,9 @@ The providers work together automatically with **zero required broker credential
 - **Which position gets read.** The prompt tells the model to judge recency by
   where each position tool's box *starts* on the time axis and to take the
   right-most one, ignoring every other tool and drawing on the chart. It also
-  reports the total it counted, so the bot can warn you when there was more
-  than one.
+  reports the total it counted and, separately, any position price is
+  currently inside — so the bot can warn you there were several and tell you
+  which one is already running.
 - The backend **calculates the percentages deterministically** (per the roadmap
   formulas), classifies the order, validates that the setup is coherent, and
   formats the reply.
@@ -167,10 +175,22 @@ The providers work together automatically with **zero required broker credential
   enough most of the time, but that label is a moment that has already passed,
   and when it's small or occluded the model returns null — which used to make
   every such setup look like a market execution. Entry within
-  `MARKET_ORDER_TOLERANCE` (0.05%) of the live price is a market execution and
-  starts **live**; anything else is a pending `LIMIT`/`STOP` that starts
-  **pending** and waits for price to reach entry before any breakeven/TP/SL
-  alert can fire.
+  `MARKET_ORDER_TOLERANCE` of the live price is a market execution and starts
+  **live**; anything else is a pending `LIMIT`/`STOP` that starts **pending**
+  and waits for price to reach entry before any breakeven/TP/SL alert can fire.
+
+  The tolerance is deliberately tight (1 basis point) because the two
+  misreadings don't cost the same. Calling a market order "pending" is cheap —
+  price is already on the entry, so the fill fires on the next poll a minute
+  later. Calling a limit order "market" is expensive: the bot believes you're
+  in a position you never opened and starts sending breakeven and TP/SL alerts
+  for it. When in doubt it treats the order as pending.
+
+  If no feed carries the asset, the model's **visual** read decides instead —
+  it reports whether the entry line sits above, below, or on the current price
+  level. Judging which of two lines is higher is far more reliable than reading
+  both prices off the axis and subtracting. With neither signal the bot names
+  the side but not the order type, rather than guessing `LIMIT` vs `STOP`.
 - **Monitoring samples ranges, not points.** Every 60 s a background job asks
   each provider for the 1-minute candles covering the time since that trade
   was last checked, and tests TP/SL/breakeven against the interval's high and

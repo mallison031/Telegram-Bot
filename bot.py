@@ -63,8 +63,14 @@ MONITOR_INTERVAL = 60
 # Drop a monitored trade after this many hours so stale setups don't pile up
 # (0 disables expiry)
 TRADE_TTL_HOURS = float(os.environ.get("TRADE_TTL_HOURS", "72"))
-# Entry within this fraction of the current price counts as a market order
-MARKET_ORDER_TOLERANCE = 0.0005
+# Entry within this fraction of the current price counts as a market order.
+# Deliberately tight (1 basis point). The two misreadings are not equally
+# costly: calling a market order "pending" is cheap, because price is already
+# sitting on the entry and the fill fires on the next poll a minute later.
+# Calling a limit order "market" is expensive — the bot believes you are in a
+# position you never opened and starts sending breakeven and TP/SL alerts for
+# it. So when in doubt, treat it as pending.
+MARKET_ORDER_TOLERANCE = 0.0001
 # Relative tolerance for treating a re-sent chart as the same trade
 DUPLICATE_TOLERANCE = 0.001
 
@@ -180,6 +186,19 @@ def register_chat(chat_id: int) -> None:
 # Vision extraction (Gemini) — returns raw values only, no math, no prose
 # ---------------------------------------------------------------------------
 
+class ActivePosition(BaseModel):
+    """A second position tool the chart shows as already running.
+
+    Reported for information only — the bot signals and monitors the most
+    recent setup, not this one.
+    """
+
+    direction: Literal["LONG", "SHORT"]
+    entry: Optional[float] = None
+    stop_loss: Optional[float] = None
+    take_profit: Optional[float] = None
+
+
 class ChartAnalysis(BaseModel):
     """Raw values Gemini extracts from the image. All math happens in code.
 
@@ -193,9 +212,17 @@ class ChartAnalysis(BaseModel):
     stop_loss: Optional[float] = None
     take_profit: Optional[float] = None
     current_price: Optional[float] = None
+    # Where the entry line sits relative to the current price, judged
+    # visually. Reading two prices off a chart and subtracting them is far
+    # more error-prone than seeing which line is higher, and this is the only
+    # thing that can classify the order when no feed carries the asset.
+    entry_placement: Optional[Literal["above", "below", "at"]] = None
     # How many position tools are drawn on the chart. When more than one, the
     # values above describe the most recent (right-most) of them.
     position_count: Optional[int] = None
+    # A different position tool that price is currently inside — a trade
+    # already running, as opposed to the setup being signalled.
+    active_position: Optional[ActivePosition] = None
 
 
 class TradeData(BaseModel):
@@ -207,6 +234,7 @@ class TradeData(BaseModel):
     stop_loss: float
     take_profit: float
     current_price: Optional[float] = None
+    entry_placement: Optional[Literal["above", "below", "at"]] = None
     position_count: int = 1
 
 
@@ -250,9 +278,33 @@ axis on the right.
 "LONG" if the red box is BELOW the entry line.
 - current_price is the price the market is currently trading at: the \
 highlighted/coloured label on the right price axis, level with the last candle \
-on the right edge. This decides whether the setup is a pending order or a \
-market execution, so read it carefully. If you genuinely cannot see it, set it \
-to null rather than guessing.
+on the right edge. If you genuinely cannot see it, set it to null rather than \
+guessing.
+
+IS IT A PENDING ORDER OR A MARKET EXECUTION:
+Set entry_placement by LOOKING at the chart, not by comparing numbers. Find the \
+horizontal entry line of the position you returned, and find the level of the \
+current price (the last candle on the right edge / the highlighted price-axis \
+label). Then:
+- "above" - the entry line is drawn clearly ABOVE the current price level
+- "below" - the entry line is drawn clearly BELOW the current price level
+- "at"    - the entry line sits ON the current price, level with the last \
+candle, so the trade would execute immediately
+
+Judge this visually. Seeing which line is higher is reliable; reading two \
+prices off the axis and subtracting them is not. Most drawn setups are pending \
+orders placed away from the current price — only answer "at" when the entry \
+line genuinely touches the latest candle's price level.
+
+IS ANOTHER POSITION ALREADY RUNNING:
+Besides the most recent position, the chart may show a DIFFERENT position tool \
+that is currently live: price has already passed its entry line and the candles \
+are now travelling between that entry and its take profit or stop loss, with \
+the tool extending to the right edge alongside the latest candles. If such a \
+position exists AND it is not the same one you returned above, describe it in \
+active_position (its direction, and its entry/stop_loss/take_profit if you can \
+read them). If there is no such position, or the position you returned above is \
+itself the running one, leave active_position null.
 
 Extract only the raw values. Do NOT calculate anything. Do NOT write a message. \
 Return only the structured data.
@@ -331,6 +383,7 @@ def to_trade_data(analysis: ChartAnalysis) -> Optional[TradeData]:
         stop_loss=analysis.stop_loss,
         take_profit=analysis.take_profit,
         current_price=analysis.current_price,
+        entry_placement=analysis.entry_placement,
         position_count=max(1, analysis.position_count or 1),
     )
 
@@ -378,15 +431,30 @@ def entry_fill_direction(
 ) -> Optional[str]:
     """Which way price must travel to reach entry: 'up', 'down', or None.
 
-    None means the order executes immediately at market — either entry sits on
-    the current price, or no price was available to compare it against.
+    None means the order executes immediately at market: entry sits on the
+    current price.
+
+    A numeric comparison against a real price wins when one is available.
+    Failing that we fall back to where the model *saw* the entry line sitting
+    relative to the last candle — judging which of two lines is higher is a
+    far easier visual task than reading both prices off the axis correctly,
+    and it is the only signal left for an asset no feed carries.
     """
     current = reference_price(data, live_price)
-    if current is None:
+    if current is not None:
+        if abs(data.entry - current) / data.entry < MARKET_ORDER_TOLERANCE:
+            return None
+        return "up" if data.entry > current else "down"
+
+    if data.entry_placement == "above":
+        return "up"
+    if data.entry_placement == "below":
+        return "down"
+    if data.entry_placement == "at":
         return None
-    if abs(data.entry - current) / data.entry < MARKET_ORDER_TOLERANCE:
-        return None
-    return "up" if data.entry > current else "down"
+    # Nothing to compare against at all — assume pending rather than claim a
+    # position is open. See MARKET_ORDER_TOLERANCE for why that way round.
+    return "unknown"
 
 
 def determine_order_type(
@@ -403,6 +471,11 @@ def determine_order_type(
     fill = entry_fill_direction(data, live_price)
     if fill is None:
         return f"{action} MARKET"
+    if fill == "unknown":
+        # Pending, but with no price reference there is no way to say which
+        # side of the market the entry sits on, and LIMIT vs STOP is exactly
+        # that question. Better to name neither than to guess wrong.
+        return action
 
     if data.direction == "SHORT":
         # Selling above the market waits for price to rise -> LIMIT
@@ -439,6 +512,47 @@ def build_signal_message(data: TradeData, live_price: Optional[float] = None) ->
         f"TP: {tp}\n"
         f"Profit: +{profit}% / Loss: -{loss}%"
     )
+
+
+def describe_chart_context(
+    analysis: ChartAnalysis, data: TradeData, decimals: int
+) -> Optional[str]:
+    """What else was on the chart besides the setup being signalled.
+
+    Two things are worth saying out loud: that several position tools were
+    drawn and only the most recent was read, and that one of the others is a
+    trade already running. Neither changes the signal, but silently picking
+    one position out of five looks like the bot misread the chart.
+    """
+    lines = []
+
+    if data.position_count > 1:
+        lines.append(
+            f"👀 {data.position_count} position tools on that chart — I read "
+            "the most recent one (furthest right). Crop to a single position "
+            "if you meant a different one."
+        )
+
+    running = analysis.active_position
+    if running:
+        levels = " · ".join(
+            f"{label} {value:.{decimals}f}"
+            for label, value in (
+                ("entry", running.entry),
+                ("SL", running.stop_loss),
+                ("TP", running.take_profit),
+            )
+            if value is not None and value > 0
+        )
+        lines.append(
+            f"⚡ A {running.direction} on that chart is already running"
+            + (f" — {levels}" if levels else "")
+            + ".\nThat one is not monitored: the signal above is for the most "
+            "recent setup. Send the running trade as its own chart if you want "
+            "breakeven and TP/SL alerts for it too."
+        )
+
+    return "\n\n".join(lines) if lines else None
 
 
 def validate(data: TradeData) -> Optional[str]:
@@ -878,10 +992,16 @@ def check_trade(trade: dict, sample: PriceSample) -> Optional[str]:
     if trade.get("status") == "pending":
         # Entry can sit either side of the market, so test the extreme that
         # travels towards it rather than assuming a direction.
-        if trade.get("fill_direction") == "down":
-            if sample.low <= trade["entry"]:
-                return "entry"
-        elif sample.high >= trade["entry"]:
+        fill = trade.get("fill_direction")
+        if fill == "down":
+            touched = sample.low <= trade["entry"]
+        elif fill == "up":
+            touched = sample.high >= trade["entry"]
+        else:
+            # Which side entry sits on was never established, so any interval
+            # that spans the entry level counts as having reached it.
+            touched = sample.low <= trade["entry"] <= sample.high
+        if touched:
             return "entry"
         return "missed" if reached_tp else None
 
@@ -1219,12 +1339,9 @@ async def handle_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         decimals = signal_decimals(data)
         await message.reply_text(build_signal_message(data, live_price))
 
-        if data.position_count > 1:
-            await message.reply_text(
-                f"👀 I found {data.position_count} position tools on that chart "
-                "and read the most recent one (furthest right). Crop to a single "
-                "position if you meant a different one."
-            )
+        context_note = describe_chart_context(analysis, data, decimals)
+        if context_note:
+            await message.reply_text(context_note)
 
         if not market:
             await message.reply_text(
@@ -1267,7 +1384,9 @@ async def handle_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             # A pending order isn't a position yet — no TP/SL/breakeven alerts
             # until price actually touches the entry level.
             "status": "pending" if fill else "active",
-            "fill_direction": fill,
+            # "unknown" means we never established which side of the market
+            # entry sits on; check_trade then fills on any touch either way.
+            "fill_direction": fill if fill in ("up", "down") else None,
             "created_at": utcnow_iso(),
         })
         save_state()
@@ -1277,9 +1396,10 @@ async def handle_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 f"\nMonitoring stops automatically after {TRADE_TTL_HOURS:g}h."
                 if TRADE_TTL_HOURS > 0 else ""
             )
-            away = "above" if fill == "up" else "below"
+            where = {"up": " — entry sits above the market",
+                     "down": " — entry sits below the market"}.get(fill, "")
             await message.reply_text(
-                f"⏳ Pending order — entry sits {away} the market"
+                f"⏳ Pending order{where}"
                 + (f" ({live_price:.{decimals}f})" if live_price else "")
                 + f", so nothing is open yet. I'll tell you when price reaches "
                 f"{data.entry:.{decimals}f}, then watch for breakeven "
