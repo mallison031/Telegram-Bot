@@ -1293,23 +1293,43 @@ async def cancel_trade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+async def typing(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    """Show the typing indicator — cosmetic, so never let it break the reply.
+
+    sendChatAction is rejected outright in channels. This used to run outside
+    the handler's try block, so a channel post raised here and the chart was
+    never analysed at all, silently.
+    """
+    try:
+        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    except Exception as error:  # noqa: BLE001 - an indicator is not worth failing over
+        logger.debug("No typing indicator for chat %s: %s", chat_id, error)
+
+
 async def handle_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle an incoming chart image (photo or image file)."""
-    message = update.effective_message
+    # Editing a channel post re-delivers it as edited_channel_post; analysing
+    # it again would repost the same signal.
+    if update.edited_message or update.edited_channel_post:
+        return
 
-    if message.photo:
-        file = await message.photo[-1].get_file()
-        mime_type = "image/jpeg"  # Telegram re-encodes photos as JPEG
-    elif message.document and (message.document.mime_type or "").startswith("image/"):
-        file = await message.document.get_file()
-        mime_type = message.document.mime_type
-    else:
+    message = update.effective_message
+    if message is None:
         return
 
     register_chat(message.chat_id)
-    await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
+    await typing(context, message.chat_id)
 
     try:
+        if message.photo:
+            file = await message.photo[-1].get_file()
+            mime_type = "image/jpeg"  # Telegram re-encodes photos as JPEG
+        elif message.document and (message.document.mime_type or "").startswith("image/"):
+            file = await message.document.get_file()
+            mime_type = message.document.mime_type
+        else:
+            return
+
         image_bytes = bytes(await file.download_as_bytearray())
         analysis = await asyncio.to_thread(extract_chart_analysis, image_bytes, mime_type)
 
@@ -1488,6 +1508,21 @@ BOT_COMMANDS = [
 ]
 
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log anything a handler raised.
+
+    Without this, python-telegram-bot swallows handler exceptions with a
+    single "No error handlers are registered" line and no traceback — which is
+    how a channel post failing on sendChatAction looked like the bot simply
+    ignoring the chart.
+    """
+    chat = getattr(getattr(update, "effective_chat", None), "id", None)
+    kind = getattr(getattr(update, "effective_chat", None), "type", None)
+    logger.error(
+        "Handler failed for chat %s (%s)", chat, kind, exc_info=context.error
+    )
+
+
 async def register_commands(app: Application) -> None:
     """Populate the command menu and check group visibility (best effort)."""
     global reads_all_group_messages
@@ -1528,6 +1563,7 @@ def main() -> None:
     app.add_handler(CommandHandler("trades", list_trades))
     app.add_handler(CommandHandler("cancel", cancel_trade))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_chart))
+    app.add_error_handler(on_error)
 
     # Each run samples the price range since the previous one, so a tick
     # missed while the host slept is covered by the next one's lookback
