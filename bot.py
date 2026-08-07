@@ -519,18 +519,18 @@ def describe_chart_context(
 ) -> Optional[str]:
     """What else was on the chart besides the setup being signalled.
 
-    Two things are worth saying out loud: that several position tools were
-    drawn and only the most recent was read, and that one of the others is a
-    trade already running. Neither changes the signal, but silently picking
-    one position out of five looks like the bot misread the chart.
+    Only one thing is worth saying out loud: that another position on the
+    chart is a trade already running. The count of position tools is logged
+    rather than messaged — the model is still asked for it, because counting
+    them makes it look at all of them before choosing, but reporting it back
+    is noise on a chart that always has several.
     """
     lines = []
 
     if data.position_count > 1:
-        lines.append(
-            f"👀 {data.position_count} position tools on that chart — I read "
-            "the most recent one (furthest right). Crop to a single position "
-            "if you meant a different one."
+        logger.info(
+            "%s: %d position tools on the chart, read the most recent",
+            data.asset.upper(), data.position_count,
         )
 
     running = analysis.active_position

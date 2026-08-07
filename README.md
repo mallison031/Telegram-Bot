@@ -83,8 +83,8 @@ drawn on it — you'll get the formatted signal back in a few seconds.
   tools from earlier setups. The bot reads the **newest** one, judged by which
   tool's box *starts* furthest right on the time axis, and ignores the rest.
   Recency is judged by where a tool starts, not how far right it reaches, so
-  an older position still running to the right edge doesn't win. When it sees
-  more than one, it says so, in case you meant a different one.
+  an older position still running to the right edge doesn't win. The number of
+  tools it counted goes to the log, not the chat.
 - **Running trades are called out** — if another position on the chart is
   already live (price has passed its entry and is travelling between entry and
   TP/SL), the bot tells you it's running and gives its levels, on top of the
@@ -163,9 +163,10 @@ The providers work together automatically with **zero required broker credential
 - **Which position gets read.** The prompt tells the model to judge recency by
   where each position tool's box *starts* on the time axis and to take the
   right-most one, ignoring every other tool and drawing on the chart. It also
-  reports the total it counted and, separately, any position price is
-  currently inside — so the bot can warn you there were several and tell you
-  which one is already running.
+  reports the total it counted — asking for a count makes it look at all of
+  them before choosing, and the number goes to the log rather than the chat —
+  and, separately, any position price is currently inside, which is what the
+  running-trade note is built from.
 - The backend **calculates the percentages deterministically** (per the roadmap
   formulas), classifies the order, validates that the setup is coherent, and
   formats the reply.
