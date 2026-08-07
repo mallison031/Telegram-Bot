@@ -2,6 +2,11 @@ services:
   - type: web
     name: signal-bot
     runtime: python
+    # Free instances get no persistent disk, so state.json is wiped on every
+    # redeploy and restart and monitored trades are forgotten — re-send the
+    # chart to re-register. To persist them, switch to `plan: starter` and add:
+    #   disk: {name: bot-state, mountPath: /var/data, sizeGB: 1}
+    #   envVars: STATE_FILE=/var/data/state.json
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
@@ -9,7 +14,4 @@ services:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: GEMINI_API_KEY
-        sync: false
-      # Set this — it defaults to West Africa Time (Africa/Lagos)
-      - key: TIMEZONE
         sync: false

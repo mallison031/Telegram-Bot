@@ -12,7 +12,12 @@ TP: 60361.53
 Profit: +5.02% / Loss: -0.26%
 ```
 
-See `telegram_bot_roadmap.md` for the full design.
+The order type is not decorative: the bot checks the **live price** to tell a
+`MARKET` execution (position open now) from a pending `LIMIT`/`STOP` (nothing
+open until price reaches your entry), and monitors each accordingly.
+
+See `telegram_bot_roadmap.md` for the full design. Automated broker execution
+is shelved — see the status note in `MT5_MOBILE_AUTOMATION.md`.
 
 ## Setup (one time)
 
@@ -74,46 +79,51 @@ drawn on it — you'll get the formatted signal back in a few seconds.
 ## Features
 
 - **Chart signals** — send a chart screenshot, get the formatted signal back.
-- **Pending orders are tracked as pending** — a `LIMIT`/`STOP` setup isn't a
-  position yet, so the bot stays quiet about breakeven/TP/SL until price
-  actually touches your entry, then messages you that the order should be
-  filled. If price runs to TP without ever filling, it tells you the setup
-  played out without you instead of claiming a win you never took.
-- **Breakeven alert** — once the trade is live, the bot watches the price
-  (Bybit public API) and messages you to move SL to breakeven once
-  price covers **30% of the distance from entry to TP**.
-- **TP/SL result messages** — when the trade hits take profit or stop loss,
-  the bot sends a motivation message (and stops monitoring that trade).
+- **The most recent position wins** — charts usually carry several position
+  tools from earlier setups. The bot reads the **right-most** one (time runs
+  left to right, so the right-most tool is the newest) and ignores the rest.
+  When it sees more than one, it says so, in case you meant a different one.
+- **Market execution vs pending order** — the bot fetches the **live price**
+  and compares it to your entry. Entry sitting on the market is a market
+  execution (`BUY MARKET` / `SELL MARKET`), monitored as already open. Entry
+  away from the market is a pending `LIMIT` or `STOP` that isn't a position
+  yet, so the bot stays quiet about breakeven/TP/SL until price actually
+  touches your entry, then tells you the order should be filled. If price
+  runs to TP without ever filling, it says the setup played out without you
+  instead of claiming a win you never took.
+- **TP and SL alerts catch wicks** — levels are tested against the **high and
+  low of every polling interval**, not the last traded price, so a spike that
+  tags your stop and snaps back inside the same minute still counts. When one
+  interval covers both TP and SL, the bot reports the SL: which came first is
+  unknowable, and claiming the win would be the worse error.
+- **Breakeven alert** — once the trade is live, the bot messages you to move
+  SL to breakeven once price covers **30% of the distance from entry to TP**.
 - **No duplicates, no stale trades** — re-sending the same chart won't
   register the trade twice, and monitoring stops on its own after
   `TRADE_TTL_HOURS` (default 72) if nothing has resolved.
-- **Morning and night motivation** — a fresh Gemini-written text each day at
-  `MORNING_HOUR` (default 8:00) and `NIGHT_HOUR` (default 20:00), in
-  `TIMEZONE` (default `Africa/Lagos` / West Africa Time), to every chat that
-  has used the bot. The morning text is a plan-your-day nudge; the night one is a
-  wind-down (journal your trades, no revenge trading, rest).
 
 ### Commands
 
 | Command | What it does |
 | --- | --- |
 | `/start` | Usage hint |
-| `/trades` | List the trades being monitored in this chat, with status |
+| `/trades` | One line per monitored trade: `⏳` pending · `🔴` live · `🔒` at breakeven |
 | `/cancel [n\|all]` | Stop monitoring one trade (or all of them) |
-| `/motivate` | Send the morning text right now (handy for testing) |
-| `/night` | Send the night text right now |
 
 The command menu is registered with Telegram automatically at startup.
 
 ### Which assets can be monitored
 
-| Instruments | Provider | Needs |
-| --- | --- | --- |
-| Instruments | Provider | Update rate | Needs |
+| Instruments | Provider | Sampling | Needs |
 | --- | --- | --- | --- |
-| Spot Gold & Silver (`XAUUSD`, `XAGUSD`) | GoldAPI (`gold-api.com`) | every 60 s | nothing |
-| Forex, Indices, Oil (`EURUSD`, `US30`, `USOIL`…) | Yahoo Finance | every 60 s | nothing |
-| Crypto (`BTCUSD`, `ETHUSD`, `SOLUSD`…) | Bybit | every 60 s | nothing |
+| Spot Gold & Silver (`XAUUSD`, `XAGUSD`) | GoldAPI (`gold-api.com`) | spot price every 60 s | nothing |
+| Forex, Indices, Oil (`EURUSD`, `US30`, `USOIL`…) | Yahoo Finance | 1-min high/low | nothing |
+| Crypto (`BTCUSD`, `ETHUSD`, `SOLUSD`…) | Bybit | 1-min high/low | nothing |
+
+> **Metals are the one gap.** `gold-api.com` publishes a spot price and nothing
+> else — it has no OHLC endpoint — so `XAUUSD` and `XAGUSD` are still sampled
+> pointwise once a minute and can miss a TP/SL wick that reverses within that
+> minute. Every other instrument gets true interval high/low and cannot miss one.
 
 The providers work together automatically with **zero required broker credentials or API keys**:
 - **GoldAPI** is checked first for spot metals (`XAUUSD` -> `XAU`, `XAGUSD` -> `XAG`). This uses real-time spot prices rather than COMEX futures so your Stop Loss and Take Profit levels match spot CFD broker charts exactly.
@@ -141,26 +151,43 @@ The providers work together automatically with **zero required broker credential
   newest Flash first, older ones as backup — because free-tier models
   occasionally return "high demand" errors.
 - Gemini is forced to return **structured JSON only** (asset, direction,
-  entry, SL, TP, current price) via a response schema — it never writes the
-  final message and never does math.
+  entry, SL, TP, current price, how many position tools it saw) via a response
+  schema — it never writes the final message and never does math.
+- **Which position gets read.** The prompt tells the model to judge recency by
+  where each position tool's box *starts* on the time axis and to take the
+  right-most one, ignoring every other tool and drawing on the chart. It also
+  reports the total it counted, so the bot can warn you when there was more
+  than one.
 - The backend **calculates the percentages deterministically** (per the roadmap
-  formulas), deduces the order type (LIMIT/STOP) by comparing entry to the
-  current price, validates that the setup is coherent, and formats the reply.
-- That same entry-vs-current-price comparison decides whether the trade starts
-  out **pending** or **live**: a market order is live immediately, while a
-  LIMIT/STOP order waits for price to reach entry before any breakeven/TP/SL
-  alert can fire. Every 60 s a background job checks each monitored trade
-  against the live price and advances it through those states.
+  formulas), classifies the order, validates that the setup is coherent, and
+  formats the reply.
+- **The live feed classifies the order, not the screenshot.** Before replying,
+  the bot resolves the asset's price feed and fetches the current price, then
+  compares it to the entry. Gemini reads the chart's own price label well
+  enough most of the time, but that label is a moment that has already passed,
+  and when it's small or occluded the model returns null — which used to make
+  every such setup look like a market execution. Entry within
+  `MARKET_ORDER_TOLERANCE` (0.05%) of the live price is a market execution and
+  starts **live**; anything else is a pending `LIMIT`/`STOP` that starts
+  **pending** and waits for price to reach entry before any breakeven/TP/SL
+  alert can fire.
+- **Monitoring samples ranges, not points.** Every 60 s a background job asks
+  each provider for the 1-minute candles covering the time since that trade
+  was last checked, and tests TP/SL/breakeven against the interval's high and
+  low. Comparing only the last traded price meant a level counted solely if
+  price was still beyond it at the instant of the poll, so wicks were invisible
+  and trades ran on past their stops. The lookback is bounded by the trade's
+  own `created_at`, so a wick from before you sent the chart can't resolve it,
+  and capped at `MAX_LOOKBACK_MINUTES` (180) so waking from a long sleep
+  doesn't request a day of history.
+- **One bad trade can't silence the rest.** Each trade is checked inside its
+  own `try`, because an unexpected key used to raise mid-loop and abort the
+  cycle for every trade in every chat, every minute, indefinitely.
 - **Pair resolution** downloads Bybit's full symbol list per market category
   (cached 6 h) and matches the chart's asset against it, preferring `linear`
   (USDT perpetuals) over `spot`. Per-cycle pricing then uses a targeted
   single-symbol call, because the full linear ticker payload is ~550 KB and
   fetching that every minute would be wasteful.
-- **The scheduled texts are state-driven, not timer-driven.** The bot records
-  the date each text was last sent in `state.json` and checks every 5 minutes
-  whether today's is still outstanding. A one-shot daily timer is silently
-  dropped if the host happens to be asleep at that exact minute — this
-  survives that, and delivers the message late (up to 6 h) instead of never.
 
 ## How the Telegram side works
 
@@ -205,7 +232,7 @@ You (Telegram app)                Telegram servers                 This bot
    photos/image files → chart analysis; `/start` → the welcome text; anything
    else → no handler, so no reply.
 5. **Push messages without an incoming message:** for breakeven/TP/SL alerts
-   and the morning motivation, the bot calls `sendMessage` on its own using
+   the bot calls `sendMessage` on its own using
    the `chat_id`s it saved in `state.json` — a bot may message any chat where
    the user has already started a conversation with it. (This also means the
    bot cannot message anyone who has never opened it — Telegram forbids
@@ -216,23 +243,45 @@ You (Telegram app)                Telegram servers                 This bot
 - **One consumer at a time:** a bot token supports either an active webhook
   *or* polling — not both at once. That's why local runs require stopping the
   Render deployment first (see *Switching back to local runs* below).
-- **Groups:** the bot works in group chats too, but by default BotFather's
-  *privacy mode* means it only sees photos sent as replies to it or messages
-  mentioning it. Disable privacy mode via BotFather (`/setprivacy`) if you
-  want it to react to every chart posted in a group.
+- **Groups — read the next section.** The bot analyses a chart from *any*
+  sender, but Telegram's privacy mode stops most of them ever reaching it.
 - **Photos vs. files:** Telegram re-compresses photos to JPEG; sending the
   screenshot as a *file/document* preserves full quality, which can help
   Gemini read small price labels. The bot accepts both.
+
+## Reading every member's charts in a group
+
+The bot has never cared who sent a photo — there is no sender filter in the
+code, and any member's chart is analysed the same way. What gets in the way is
+**Telegram's privacy mode**, which is ON by default for every new bot. While it
+is on, a bot in a group is only *delivered* commands, @mentions, and replies to
+its own messages. Other members' photos never reach it at all, so there is
+nothing for the code to respond to.
+
+There is no Bot API call that can change this — it is a BotFather setting:
+
+1. Open [@BotFather](https://t.me/BotFather)
+2. `/setprivacy` → choose your bot → **Disable**
+3. **Remove the bot from the group and add it back.** The change only applies
+   on re-join; existing memberships keep the old setting.
+
+The bot checks this for you at startup via `getMe` and logs which state it is
+in:
+
+```
+Privacy mode is OFF — every member's charts are visible in groups
+```
+
+If privacy mode is still on it logs a warning instead, and `/start` in a group
+replies with the steps above — so this fails loudly rather than looking like a
+bot that just ignores people.
 
 ## Hosting free on Render
 
 The bot has two modes, picked automatically:
 
 - **Locally** (no `RENDER_EXTERNAL_URL`/`WEBHOOK_URL` set): long polling.
-- **On Render**: webhook mode — Telegram POSTs each message to your Render
-  URL, which is what **wakes the free service from sleep**. First reply after
-  15+ minutes of inactivity takes ~30–60 s while the service wakes (Telegram
-  retries delivery, so no message is lost); after that replies are instant.
+- **On Render**: webhook mode — Telegram POSTs each message to your Render URL.
 
 ### Deploy steps
 
@@ -245,54 +294,83 @@ The bot has two modes, picked automatically:
      `python bot.py`, instance type **Free**.
 3. When prompted, set the environment variables:
    - `TELEGRAM_BOT_TOKEN`, `GEMINI_API_KEY` — required
-   - `TIMEZONE` — set it (e.g. `Africa/Lagos`), or the scheduled texts run on
-     UTC and arrive at the wrong local hour
-   - live prices need no key — Bybit's API is public
+   - live prices need no key — every feed the bot uses is public
 4. Deploy. Once live, the bot registers its own webhook with Telegram —
    no manual webhook setup needed. Send `/start` to the bot to confirm.
 
-### Keep the service awake (required for monitoring & scheduled texts)
+### Keep the service awake (required for monitoring)
 
-A sleeping service can't watch live prices or send scheduled messages, so set
-up a free uptime pinger to keep it awake 24/7:
+A free service sleeps after 15 minutes idle, and **a sleeping service runs no
+monitoring job at all**. Incoming Telegram messages wake it (the first reply
+takes ~30–60 s; Telegram retries, so nothing is lost), but alerts need it awake
+continuously. Add a free uptime pinger:
 
 1. Sign up at [uptimerobot.com](https://uptimerobot.com) (free) — or
    [cron-job.org](https://cron-job.org).
 2. Add an HTTP(S) monitor pointing at your Render URL
    (`https://<your-app>.onrender.com/`) with a **5-minute interval**.
 
-That's it — the pings stop Render from ever idling the service. One always-on
-service uses ~730 of the free plan's 750 instance-hours per month, so it fits.
+The pings stop Render idling the service. One always-on service uses ~730 of
+the free plan's 750 instance-hours per month, so it fits.
 
-> Note: monitored trades, the subscriber list and the record of which texts
-> have already gone out are stored in a local `state.json` (gitignored — it
-> holds your chat IDs and open positions, so don't commit it). On Render's
-> free tier this file is wiped on every redeploy or restart: monitored trades
-> are forgotten (re-send the chart to re-register), and a redeploy shortly
-> after a scheduled text can send it a second time. To make it survive, attach
-> a Render persistent disk and point `STATE_FILE` at a path on it.
+### Where state lives
+
+Monitored trades and the chat list are stored in `state.json` (gitignored — it
+holds your chat IDs and open positions, so don't commit it). Writes go through
+a temp file and an atomic rename, so a crash mid-write can't truncate it.
+
+**On the free tier this file is wiped on every redeploy and restart** —
+monitored trades are forgotten, and no breakeven/TP/SL alert can fire for a
+trade registered before the last deploy. Re-send the chart to re-register.
+After the alert fixes, this is the most likely reason a real alert never
+arrives, so check `/trades` first.
+
+To make trades survive, Render requires a paid instance (~$7/month) — disks
+are not offered on free instances. Switch `render.yaml` to `plan: starter` and
+add:
+
+```yaml
+    disk:
+      name: bot-state
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: STATE_FILE
+        value: /var/data/state.json
+```
 
 ## Troubleshooting
 
-**The morning or night text didn't arrive.** Check, in order:
+**A TP or SL alert didn't arrive.** Check, in order:
 
-1. **Send `/motivate`.** If a message comes back, Gemini and delivery are fine
-   and the problem is timing, not the bot. If nothing comes back, check the
-   logs — Gemini failures fall back to a canned message, so silence points at
-   Telegram delivery or the chat not being registered (send `/start`).
-2. **Is `TIMEZONE` set on the host?** Unset means UTC — an 8:00 text lands at
-   9:00 in Lagos, 4:00 in New York. The startup log prints the resolved
-   timezone and the local time, e.g.
-   `Motivation texts: morning 08:00, night 20:00 (Africa/Lagos, now ...)`.
-3. **Was the service awake?** A sleeping free-tier service runs no jobs at all.
-   The bot now catches up on a text it missed while asleep (up to 6 hours
-   late), but it can only do that once it wakes — set up the uptime pinger
-   above.
-4. **Did the chat ever `/start` the bot?** Scheduled texts only go to chats in
-   `state.json`. That list is lost when the free-tier filesystem resets;
-   sending any message to the bot re-registers the chat.
+1. **Is the trade still registered?** Send `/trades`. If it isn't listed, it
+   isn't being watched — a free-tier redeploy wipes `state.json`. Re-send the
+   chart to re-register.
+2. **Was the service awake?** A sleeping service runs no monitoring job at
+   all. On waking, the next cycle looks back over the gap (up to
+   `MAX_LOOKBACK_MINUTES`, 180) and will still report a level crossed while it
+   slept — but only up to that cap, so set up the uptime pinger.
+3. **Was it still pending?** A `⏳` trade has not filled, and pending orders
+   deliberately get no TP/SL alerts until price touches your entry.
+4. **Is it gold or silver?** `gold-api.com` has no OHLC endpoint, so metals are
+   sampled pointwise and a wick that reverses inside the minute can be missed.
+   Everything else is checked on interval high/low and cannot miss one.
+5. **Check the logs.** Every event logs its sample, e.g.
+   `XAUUSD SHORT -> SL (last 4310.93, range 4309.82-4310.93 over 2m)`. A trade
+   that keeps failing logs `Monitoring failed for <asset> in chat <id>` with a
+   traceback each cycle, without affecting any other trade.
 
-**A trade says monitoring is unavailable.** Neither Yahoo Finance nor Bybit lists that asset symbol. Make sure the asset is a standard ticker symbol (e.g. `XAUUSD`, `EURUSD`, `US30`, `BTCUSD`).
+**The bot ignores charts from other people in my group.** Telegram privacy
+mode is still on — see *Reading every member's charts in a group*. Remember
+the remove-and-re-add step; disabling it in BotFather alone does nothing for a
+group the bot is already in.
+
+**It read the wrong position off my chart.** The bot takes the right-most
+position tool. If two start at nearly the same point the model can pick the
+other one — crop the screenshot to the setup you mean. When it sees more than
+one tool it tells you how many it found.
+
+**A trade says monitoring is unavailable.** No feed lists that asset symbol. Make sure the asset is a standard ticker symbol (e.g. `XAUUSD`, `EURUSD`, `US30`, `BTCUSD`).
 
 ### Updating the bot
 

@@ -10,16 +10,14 @@ trusting the AI with math), and replies with a formatted signal:
     TP: [VALUE]
     Profit: +[X]% / Loss: -[Y]%
 
-Extra features:
-- Live trade monitoring (Yahoo Finance for forex/indices/oil/metals, Bybit for
-  crypto and gold, Twelve Data for forex fallback):
-  alerts when a pending order fills, when to move SL to breakeven once price
-  covers 30% of the distance to TP, and a motivation message on TP or SL.
-  Chart assets are matched against each provider's real instrument list
-  rather than a guessed suffix.
-- Morning and night motivation texts to every chat that has used the bot.
-  Delivery is state-driven rather than a fixed timer, so a message missed
-  while the host was asleep is still sent when the bot wakes up.
+Live trade monitoring (GoldAPI for spot metals, Yahoo Finance for
+forex/indices/oil, Bybit for crypto) alerts when a pending order fills, when
+to move SL to breakeven once price covers 30% of the distance to TP, and on
+TP or SL. Chart assets are matched against each provider's real instrument
+list rather than a guessed suffix.
+
+Levels are tested against the high and low of each polling interval, not the
+last traded price, so a wick through TP or SL between polls is still caught.
 """
 
 import asyncio
@@ -32,8 +30,7 @@ import time
 from datetime import datetime, timedelta
 from datetime import timezone as dt_timezone
 from pathlib import Path
-from typing import Literal, Optional
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from typing import Literal, NamedTuple, Optional
 
 import httpx
 from dotenv import load_dotenv
@@ -50,17 +47,12 @@ from telegram.ext import (
     filters,
 )
 
-from broker_api import broker_execution_enabled, execute_broker_order
-
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
 # Optional settings
-TIMEZONE = os.environ.get("TIMEZONE", "Africa/Lagos")  # West Africa Time (WAT)
-MORNING_HOUR = int(os.environ.get("MORNING_HOUR", "8"))   # 8:00 AM WAT
-NIGHT_HOUR = int(os.environ.get("NIGHT_HOUR", "20"))      # 8:00 PM WAT (20:00)
 STATE_FILE = Path(os.environ.get("STATE_FILE", "state.json"))
 
 
@@ -76,13 +68,8 @@ MARKET_ORDER_TOLERANCE = 0.0005
 # Relative tolerance for treating a re-sent chart as the same trade
 DUPLICATE_TOLERANCE = 0.001
 
-# How often to check whether a scheduled text is due (seconds)
-SCHEDULE_INTERVAL = 30
-# A scheduled text more than this many hours late is dropped rather than sent
-# at a nonsensical time (e.g. the morning text arriving at 6pm).
-CATCHUP_HOURS = 6
-
 BYBIT_TICKERS_URL = "https://api.bybit.com/v5/market/tickers"
+BYBIT_KLINE_URL = "https://api.bybit.com/v5/market/kline"
 # Bybit market categories to search for a pair, in order of preference:
 # linear = USDT perpetual futures (most leveraged pairs), spot = spot market
 BYBIT_CATEGORIES = ("linear", "spot")
@@ -140,14 +127,6 @@ def utcnow_iso() -> str:
     return datetime.now(dt_timezone.utc).isoformat()
 
 
-def local_timezone() -> ZoneInfo:
-    try:
-        return ZoneInfo(TIMEZONE)
-    except (ZoneInfoNotFoundError, ValueError):
-        logger.warning("Unknown TIMEZONE %r, falling back to UTC", TIMEZONE)
-        return ZoneInfo("UTC")
-
-
 def load_state() -> dict:
     data: dict = {}
     if STATE_FILE.exists():
@@ -157,22 +136,35 @@ def load_state() -> dict:
             logger.warning("Could not read %s, starting fresh", STATE_FILE)
     data.setdefault("chats", [])
     data.setdefault("trades", [])
-    # Date (YYYY-MM-DD, local) each scheduled text was last delivered
-    data.setdefault("last_sent", {})
-    # Migrate trades written by older versions, which lacked these fields
+    data.pop("last_sent", None)  # retired: the scheduled motivation texts
+    # Migrate trades written by older versions, which lacked these fields.
+    # Every key monitor_trades reads is defaulted here: a trade missing one
+    # used to raise mid-cycle and abort the checks for every other trade too.
     now = utcnow_iso()
     for trade in data["trades"]:
         trade.setdefault("status", "active")
         trade.setdefault("created_at", now)
         trade.setdefault("provider", "bybit")
+        trade.setdefault("category", "linear")
+        trade.setdefault("fill_direction", None)
+        trade.setdefault("be_alerted", False)
+        trade.setdefault("decimals", 2)
+        trade.setdefault("profit_pct", 0.0)
+        trade.setdefault("loss_pct", 0.0)
     return data
 
 
 def save_state() -> None:
+    """Persist state, writing through a temp file so a crash mid-write can't
+    truncate it — a half-written state.json loses every monitored trade.
+    """
     try:
-        STATE_FILE.write_text(json.dumps(state, indent=2))
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = STATE_FILE.with_suffix(STATE_FILE.suffix + ".tmp")
+        tmp.write_text(json.dumps(state, indent=2))
+        tmp.replace(STATE_FILE)
     except OSError:
-        logger.exception("Could not save state")
+        logger.exception("Could not save state to %s", STATE_FILE)
 
 
 state = load_state()
@@ -201,6 +193,9 @@ class ChartAnalysis(BaseModel):
     stop_loss: Optional[float] = None
     take_profit: Optional[float] = None
     current_price: Optional[float] = None
+    # How many position tools are drawn on the chart. When more than one, the
+    # values above describe the most recent (right-most) of them.
+    position_count: Optional[int] = None
 
 
 class TradeData(BaseModel):
@@ -212,6 +207,7 @@ class TradeData(BaseModel):
     stop_loss: float
     take_profit: float
     current_price: Optional[float] = None
+    position_count: int = 1
 
 
 VISION_PROMPT = """\
@@ -225,6 +221,23 @@ unreadable — set is_trading_chart to false and leave every other field null.
 
 If it IS such a chart, set is_trading_chart to true and extract the values.
 
+WHICH POSITION TO READ — this matters most:
+A chart often has several position tools drawn on it from earlier setups, plus \
+other drawings (trendlines, rectangles, fibs, notes). You must extract exactly \
+ONE position: the MOST RECENT one.
+
+The most recent position is the one furthest to the RIGHT on the chart — time \
+runs left to right, so the right-most position tool is the newest. Judge this \
+by where each tool's box STARTS (its left edge / the entry line's anchor): the \
+tool whose box starts furthest right is the most recent, even if an older tool \
+is taller or stretches further right. If two start at the same place, take the \
+one nearest the last (right-most) candle.
+
+Ignore every other position tool on the chart completely — do not average them, \
+do not blend their levels, and do not pick the largest or most obvious one. \
+Set position_count to the total number of position tools you can see (1 if \
+there is only one), and return the levels of the right-most one only.
+
 How to read the chart:
 - The asset name is usually in the top-left corner (e.g. "Bitcoin / U.S. Dollar" \
 means the asset symbol is BTCUSD). Return the compact ticker symbol.
@@ -235,9 +248,11 @@ separating them is the Entry price.
 axis on the right.
 - direction: "SHORT" if the red (stop loss) box is ABOVE the entry line, \
 "LONG" if the red box is BELOW the entry line.
-- current_price is the price the market is currently trading at (usually the \
-highlighted label on the right price axis at the last candle). If you cannot \
-determine it, set it to null.
+- current_price is the price the market is currently trading at: the \
+highlighted/coloured label on the right price axis, level with the last candle \
+on the right edge. This decides whether the setup is a pending order or a \
+market execution, so read it carefully. If you genuinely cannot see it, set it \
+to null rather than guessing.
 
 Extract only the raw values. Do NOT calculate anything. Do NOT write a message. \
 Return only the structured data.
@@ -316,6 +331,7 @@ def to_trade_data(analysis: ChartAnalysis) -> Optional[TradeData]:
         stop_loss=analysis.stop_loss,
         take_profit=analysis.take_profit,
         current_price=analysis.current_price,
+        position_count=max(1, analysis.position_count or 1),
     )
 
 
@@ -340,26 +356,53 @@ def breakeven_price(data: TradeData) -> float:
     return data.entry + (data.take_profit - data.entry) * BREAKEVEN_FRACTION
 
 
-def entry_fill_direction(data: TradeData) -> Optional[str]:
+def reference_price(data: TradeData, live_price: Optional[float] = None) -> Optional[float]:
+    """The price the entry is judged against to classify the order.
+
+    The live feed wins when we have it. Gemini reads the chart's own price
+    label well enough most of the time, but it is a screenshot of a moment
+    that has already passed, and when the label is small or occluded the model
+    returns null — which used to make every such setup look like a market
+    execution. The feed is both current and always numeric, so it decides;
+    the chart's reading is only the fallback for assets no feed carries.
+    """
+    if live_price is not None and live_price > 0:
+        return live_price
+    if data.current_price is not None and data.current_price > 0:
+        return data.current_price
+    return None
+
+
+def entry_fill_direction(
+    data: TradeData, live_price: Optional[float] = None
+) -> Optional[str]:
     """Which way price must travel to reach entry: 'up', 'down', or None.
 
-    None means the order fills immediately at market — either entry is already
-    at the current price, or the chart gave us no current price to compare to.
+    None means the order executes immediately at market — either entry sits on
+    the current price, or no price was available to compare it against.
     """
-    current = data.current_price
-    if current is None or current <= 0:
+    current = reference_price(data, live_price)
+    if current is None:
         return None
     if abs(data.entry - current) / data.entry < MARKET_ORDER_TOLERANCE:
         return None
     return "up" if data.entry > current else "down"
 
 
-def determine_order_type(data: TradeData) -> str:
-    """Deduce the pending-order type by comparing entry to current price."""
+def determine_order_type(
+    data: TradeData, live_price: Optional[float] = None
+) -> str:
+    """Classify the setup as a market execution or a pending LIMIT/STOP order.
+
+    Entry at the current price is a market execution — the position is open
+    now. Entry away from the current price is a pending order that only
+    becomes a position once price travels to it, and whether it is a LIMIT or
+    a STOP depends on which side of the market it sits.
+    """
     action = "SELL" if data.direction == "SHORT" else "BUY"
-    fill = entry_fill_direction(data)
+    fill = entry_fill_direction(data, live_price)
     if fill is None:
-        return action
+        return f"{action} MARKET"
 
     if data.direction == "SHORT":
         # Selling above the market waits for price to rise -> LIMIT
@@ -382,13 +425,13 @@ def signal_decimals(data: TradeData) -> int:
     return max(2, *(_natural_decimals(p) for p in prices))
 
 
-def build_signal_message(data: TradeData) -> str:
+def build_signal_message(data: TradeData, live_price: Optional[float] = None) -> str:
     profit, loss = calculate_percentages(data)
     decimals = signal_decimals(data)
     entry, sl, tp = (
         f"{p:.{decimals}f}" for p in (data.entry, data.stop_loss, data.take_profit)
     )
-    header = f"{data.asset.upper()} {determine_order_type(data)}"
+    header = f"{data.asset.upper()} {determine_order_type(data, live_price)}"
     return (
         f"{header}\n"
         f"ENTRY: {entry}\n"
@@ -432,6 +475,38 @@ def validate(data: TradeData) -> Optional[str]:
 
 # Cache the symbol list this long before refetching (seconds)
 BYBIT_SYMBOLS_TTL = 6 * 3600
+
+# Never ask a provider for more than this much history in one poll. Bounds the
+# catch-up after the host has been asleep for hours.
+MAX_LOOKBACK_MINUTES = 180
+
+
+class PriceSample(NamedTuple):
+    """What price did over an interval, not just where it ended up.
+
+    Comparing TP/SL against the last traded price only catches a level if
+    price is still beyond it at the instant we poll. A wick that spikes
+    through the stop and snaps back inside the same minute is invisible that
+    way, and the trade runs on as if nothing happened. Carrying the high and
+    low of the interval means any touch counts, however brief.
+    """
+
+    last: float
+    high: float
+    low: float
+
+    @classmethod
+    def point(cls, price: float) -> "PriceSample":
+        """A sample from a feed that only publishes a spot price, no range."""
+        return cls(price, price, price)
+
+
+def lookback_minutes(since: Optional[datetime], now: datetime) -> int:
+    """How many 1-minute candles to request to cover the gap since `since`."""
+    if since is None:
+        return 2
+    gap = (now - since).total_seconds()
+    return max(2, min(MAX_LOOKBACK_MINUTES, int(gap // 60) + 2))
 
 _bybit_symbols: dict[str, set[str]] = {}
 _bybit_symbols_at: dict[str, float] = {}
@@ -524,6 +599,50 @@ async def fetch_bybit_price(
         return float(tickers[0]["lastPrice"])
     except (KeyError, ValueError):
         return None
+
+
+async def fetch_bybit_sample(
+    http: httpx.AsyncClient, symbol: str, category: str, minutes: int
+) -> Optional[PriceSample]:
+    """High/low/close over the last `minutes` 1-minute candles on Bybit."""
+    try:
+        r = await http.get(
+            BYBIT_KLINE_URL,
+            params={
+                "category": category,
+                "symbol": symbol,
+                "interval": "1",
+                "limit": minutes,
+            },
+        )
+        payload = r.json()
+    except (httpx.HTTPError, ValueError):
+        return None
+    if payload.get("retCode") != 0:
+        return None
+
+    # Rows are [start_ms, open, high, low, close, volume, turnover], newest first
+    rows = (payload.get("result") or {}).get("list") or []
+    highs, lows = [], []
+    last: Optional[float] = None
+    for row in rows:
+        try:
+            high, low, close = float(row[2]), float(row[3]), float(row[4])
+        except (IndexError, TypeError, ValueError):
+            continue
+        if last is None:
+            last = close
+        highs.append(high)
+        lows.append(low)
+
+    if last is None:
+        # Klines unavailable (a brand-new listing, say) — fall back to the
+        # ticker so the trade is still checked, just without wick coverage.
+        price = await fetch_bybit_price(http, symbol, category)
+        return PriceSample.point(price) if price else None
+    return PriceSample(last, max(highs), min(lows))
+
+
 # ---------------------------------------------------------------------------
 # Live prices: Gold API (public spot metals — keyless, no account needed)
 #
@@ -597,10 +716,10 @@ def yahoo_symbol_candidates(asset: str) -> list[str]:
     return list(dict.fromkeys(candidates))
 
 
-async def fetch_yahoo_price(
+async def fetch_yahoo_chart(
     http: httpx.AsyncClient, symbol: str
-) -> Optional[float]:
-    """Current regularMarketPrice for a Yahoo Finance symbol, or None if unavailable."""
+) -> Optional[dict]:
+    """Raw 1-minute chart payload for a Yahoo Finance symbol."""
     url = f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}"
     try:
         r = await http.get(
@@ -610,15 +729,52 @@ async def fetch_yahoo_price(
         )
         if r.status_code != 200:
             return None
-        data = r.json()
-        meta = data["chart"]["result"][0]["meta"]
-        price = meta.get("regularMarketPrice")
-        if price is not None:
-            price = float(price)
-            return price if price > 0 else None
+        return (r.json()["chart"]["result"] or [None])[0]
     except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError):
         return None
-    return None
+
+
+async def fetch_yahoo_price(
+    http: httpx.AsyncClient, symbol: str
+) -> Optional[float]:
+    """Current regularMarketPrice for a Yahoo Finance symbol, or None if unavailable."""
+    result = await fetch_yahoo_chart(http, symbol)
+    if not result:
+        return None
+    try:
+        price = float(result["meta"]["regularMarketPrice"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return price if price > 0 else None
+
+
+async def fetch_yahoo_sample(
+    http: httpx.AsyncClient, symbol: str, minutes: int
+) -> Optional[PriceSample]:
+    """High/low/last over the last `minutes` 1-minute candles on Yahoo."""
+    result = await fetch_yahoo_chart(http, symbol)
+    if not result:
+        return None
+
+    try:
+        last = float(result["meta"]["regularMarketPrice"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if last <= 0:
+        return None
+
+    try:
+        quote = result["indicators"]["quote"][0]
+        highs = [h for h in (quote.get("high") or [])[-minutes:] if h]
+        lows = [low for low in (quote.get("low") or [])[-minutes:] if low]
+    except (KeyError, IndexError, TypeError):
+        highs, lows = [], []
+
+    # The quote arrays go quiet outside market hours; the last price alone is
+    # still a valid (if range-less) reading.
+    if not highs or not lows:
+        return PriceSample.point(last)
+    return PriceSample(last, max(max(highs), last), min(min(lows), last))
 
 
 # ---------------------------------------------------------------------------
@@ -657,19 +813,39 @@ async def resolve_market(asset: str) -> Optional[dict]:
     return None
 
 
-async def fetch_trade_price(
-    http: httpx.AsyncClient, trade: dict
+async def fetch_market_price(
+    http: httpx.AsyncClient, market: dict
 ) -> Optional[float]:
-    """Current price for a monitored trade."""
-    provider = trade.get("provider", "bybit")
+    """Current price for a resolved market, whichever provider carries it."""
+    provider = market["provider"]
     if provider == "bybit":
         return await fetch_bybit_price(
-            http, trade["symbol"], trade.get("category", "linear")
+            http, market["symbol"], market.get("category", "linear")
         )
     if provider == "goldapi":
-        return await fetch_goldapi_price(http, trade["symbol"])
+        return await fetch_goldapi_price(http, market["symbol"])
     if provider == "yahoo":
-        return await fetch_yahoo_price(http, trade["symbol"])
+        return await fetch_yahoo_price(http, market["symbol"])
+    return None
+
+
+async def fetch_trade_sample(
+    http: httpx.AsyncClient, trade: dict, minutes: int
+) -> Optional[PriceSample]:
+    """What price did over the last `minutes` for a monitored trade."""
+    provider = trade.get("provider", "bybit")
+    if provider == "bybit":
+        return await fetch_bybit_sample(
+            http, trade["symbol"], trade.get("category", "linear"), minutes
+        )
+    if provider == "yahoo":
+        return await fetch_yahoo_sample(http, trade["symbol"], minutes)
+    if provider == "goldapi":
+        # gold-api.com publishes a spot price and nothing else — no OHLC
+        # endpoint — so spot metals are the one feed still sampled pointwise
+        # and can miss a wick that reverses inside the polling interval.
+        price = await fetch_goldapi_price(http, trade["symbol"])
+        return PriceSample.point(price) if price else None
     logger.warning(
         "Trade on %s uses retired provider %r — it will expire on its own",
         trade.get("asset"), provider,
@@ -677,8 +853,11 @@ async def fetch_trade_price(
     return None
 
 
-def check_trade(trade: dict, price: float) -> Optional[str]:
-    """Return the event for this trade at this price, or None.
+def check_trade(trade: dict, sample: PriceSample) -> Optional[str]:
+    """Return the event for this trade over this interval, or None.
+
+    Levels are tested against the interval's high and low rather than its
+    closing price, so a level that price only touched still counts.
 
     A pending order (LIMIT/STOP) is not a position yet, so it can only report
     'entry' (price touched the entry level, order filled) or 'missed' (price
@@ -687,21 +866,34 @@ def check_trade(trade: dict, price: float) -> Optional[str]:
     Once filled, the trade reports 'tp', 'sl' or 'breakeven'.
     """
     long = trade["direction"] == "LONG"
-    reached_tp = (price >= trade["tp"]) if long else (price <= trade["tp"])
+    # The level a move in each direction reaches first
+    favourable = sample.high if long else sample.low
+    adverse = sample.low if long else sample.high
+
+    def reached(level: float, extreme: float) -> bool:
+        return extreme >= level if long else extreme <= level
+
+    reached_tp = reached(trade["tp"], favourable)
 
     if trade.get("status") == "pending":
-        if (price <= trade["entry"]) if trade.get("fill_direction") == "down" \
-                else (price >= trade["entry"]):
+        # Entry can sit either side of the market, so test the extreme that
+        # travels towards it rather than assuming a direction.
+        if trade.get("fill_direction") == "down":
+            if sample.low <= trade["entry"]:
+                return "entry"
+        elif sample.high >= trade["entry"]:
             return "entry"
         return "missed" if reached_tp else None
 
+    # SL is checked before TP: when one interval spans both levels we cannot
+    # tell which came first, and assuming the loss is the honest default —
+    # reporting a win the trade may not have taken is the worse error.
+    if (adverse <= trade["sl"]) if long else (adverse >= trade["sl"]):
+        return "sl"
     if reached_tp:
         return "tp"
-    if (price <= trade["sl"]) if long else (price >= trade["sl"]):
-        return "sl"
-    if not trade["be_alerted"]:
-        if (price >= trade["be_price"]) if long else (price <= trade["be_price"]):
-            return "breakeven"
+    if not trade.get("be_alerted") and reached(trade["be_price"], favourable):
+        return "breakeven"
     return None
 
 
@@ -737,19 +929,6 @@ SL_MESSAGES = [
     "market will still be here tomorrow — and so will your account. 🌅",
 ]
 
-FALLBACK_MORNING = [
-    "🌅 Good morning! Plan your trade, trade your plan, and manage your risk.",
-    "🌅 Morning trader! Patience is a position — wait for your A+ setup.",
-    "🌅 Rise and shine! Protect your capital first, profits will follow.",
-]
-
-FALLBACK_NIGHT = [
-    "🌙 Day's done! Journal your trades, step away from charts, and get rest.",
-    "🌙 Markets will wait. No revenge trading — rest up for tomorrow's session.",
-    "🌙 Wrap up for the day! A well-rested mind is your best trading edge.",
-]
-
-
 async def deliver(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str) -> None:
     """Push a message to a chat; a delivery failure must not abort the job."""
     try:
@@ -758,165 +937,125 @@ async def deliver(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str) -
         logger.exception("Could not deliver message to chat %s", chat_id)
 
 
+def trade_watched_since(trade: dict, now: datetime) -> Optional[datetime]:
+    """When this trade was last checked — the start of the interval to sample.
+
+    Bounding the lookback to the time we have actually been watching matters:
+    a trade registered a minute ago must not be resolved by a wick from an
+    hour before it existed.
+    """
+    for key in ("checked_at", "created_at"):
+        try:
+            return datetime.fromisoformat(trade[key])
+        except (KeyError, TypeError, ValueError):
+            continue
+    return None
+
+
+async def monitor_trade(
+    context: ContextTypes.DEFAULT_TYPE,
+    http: httpx.AsyncClient,
+    trade: dict,
+    now: datetime,
+) -> None:
+    """Check one trade against the price range since it was last checked."""
+    trades = state["trades"]
+    decimals = trade.get("decimals", 2)
+
+    if trade_expired(trade, now):
+        trades.remove(trade)
+        save_state()
+        await deliver(
+            context, trade["chat_id"],
+            f"⌛ Stopped monitoring {trade['asset']} — no result after "
+            f"{TRADE_TTL_HOURS:g}h. Re-send the chart if the setup is "
+            "still valid.",
+        )
+        return
+
+    # Self-healing: upgrade any legacy futures gold/silver trade to spot metals
+    if trade.get("provider") == "yahoo" and trade.get("symbol") in ("GC=F", "SI=F"):
+        trade["provider"] = "goldapi"
+        trade["symbol"] = "XAU" if trade["symbol"] == "GC=F" else "XAG"
+        save_state()
+
+    minutes = lookback_minutes(trade_watched_since(trade, now), now)
+    sample = await fetch_trade_sample(http, trade, minutes)
+    if sample is None:
+        return
+
+    # Only advance the watermark once a reading actually came back, so an
+    # outage doesn't blind the bot to what price did while the feed was down.
+    trade["checked_at"] = now.isoformat()
+
+    event = check_trade(trade, sample)
+    if event is None:
+        save_state()
+        return
+
+    if event == "entry":
+        trade["status"] = "active"
+        text = (
+            f"✅ {trade['asset']}: price touched your entry "
+            f"{trade['entry']:.{decimals}f} — the order should be "
+            "filled. Now watching for breakeven, TP and SL."
+        )
+    elif event == "missed":
+        trades.remove(trade)
+        text = (
+            f"🚪 {trade['asset']}: price reached TP "
+            f"({trade['tp']:.{decimals}f}) without ever filling your "
+            f"entry at {trade['entry']:.{decimals}f}. The setup played "
+            "out without you — no loss taken. Missing a trade costs "
+            "nothing; chasing one does. 🧠"
+        )
+    elif event == "breakeven":
+        trade["be_alerted"] = True
+        text = (
+            f"🔒 {trade['asset']}: price reached "
+            f"{trade['be_price']:.{decimals}f} — 30% of the way to TP.\n"
+            f"Move your STOP LOSS to BREAKEVEN ({trade['entry']:.{decimals}f}) "
+            "to make this a risk-free trade."
+        )
+    elif event == "tp":
+        trades.remove(trade)
+        text = random.choice(TP_MESSAGES).format(
+            asset=trade["asset"], profit=trade["profit_pct"]
+        )
+    else:  # sl
+        trades.remove(trade)
+        text = random.choice(SL_MESSAGES).format(
+            asset=trade["asset"], loss=trade["loss_pct"]
+        )
+
+    logger.info(
+        "%s %s -> %s (last %s, range %s-%s over %dm)",
+        trade["asset"], trade["direction"], event.upper(),
+        sample.last, sample.low, sample.high, minutes,
+    )
+    save_state()
+    await deliver(context, trade["chat_id"], text)
+
+
 async def monitor_trades(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Periodic job: check live prices for all monitored trades."""
-    trades = state["trades"]
-    if not trades:
+    if not state["trades"]:
         return
 
     now = datetime.now(dt_timezone.utc)
 
     async with httpx.AsyncClient(timeout=15) as http:
-        for trade in list(trades):
-            decimals = trade.get("decimals", 2)
-
-            if trade_expired(trade, now):
-                trades.remove(trade)
-                save_state()
-                await deliver(
-                    context, trade["chat_id"],
-                    f"⌛ Stopped monitoring {trade['asset']} — no result after "
-                    f"{TRADE_TTL_HOURS:g}h. Re-send the chart if the setup is "
-                    "still valid.",
+        for trade in list(state["trades"]):
+            # One bad trade must not abort the cycle for everyone else's.
+            # Without this an unexpected key or a malformed price silently
+            # stopped every alert in every chat, on every tick, for good.
+            try:
+                await monitor_trade(context, http, trade, now)
+            except Exception:
+                logger.exception(
+                    "Monitoring failed for %s in chat %s",
+                    trade.get("asset"), trade.get("chat_id"),
                 )
-                continue
-
-            # Self-healing: upgrade any legacy futures gold/silver trade to spot metals
-            if trade.get("provider") == "yahoo" and trade.get("symbol") in ("GC=F", "SI=F"):
-                trade["provider"] = "goldapi"
-                trade["symbol"] = "XAU" if trade["symbol"] == "GC=F" else "XAG"
-                save_state()
-
-            price = await fetch_trade_price(http, trade)
-            if price is None:
-                continue
-
-            event = check_trade(trade, price)
-            if event is None:
-                continue
-
-            if event == "entry":
-                trade["status"] = "active"
-                text = (
-                    f"✅ {trade['asset']}: price touched your entry "
-                    f"{trade['entry']:.{decimals}f} — the order should be "
-                    "filled. Now watching for breakeven, TP and SL."
-                )
-            elif event == "missed":
-                trades.remove(trade)
-                text = (
-                    f"🚪 {trade['asset']}: price reached TP "
-                    f"({trade['tp']:.{decimals}f}) without ever filling your "
-                    f"entry at {trade['entry']:.{decimals}f}. The setup played "
-                    "out without you — no loss taken. Missing a trade costs "
-                    "nothing; chasing one does. 🧠"
-                )
-            elif event == "breakeven":
-                trade["be_alerted"] = True
-                text = (
-                    f"🔒 {trade['asset']}: price reached "
-                    f"{trade['be_price']:.{decimals}f} — 30% of the way to TP.\n"
-                    f"Move your STOP LOSS to BREAKEVEN ({trade['entry']:.{decimals}f}) "
-                    "to make this a risk-free trade."
-                )
-            elif event == "tp":
-                trades.remove(trade)
-                text = random.choice(TP_MESSAGES).format(
-                    asset=trade["asset"], profit=trade["profit_pct"]
-                )
-            else:  # sl
-                trades.remove(trade)
-                text = random.choice(SL_MESSAGES).format(
-                    asset=trade["asset"], loss=trade["loss_pct"]
-                )
-
-            save_state()
-            await deliver(context, trade["chat_id"], text)
-
-
-# ---------------------------------------------------------------------------
-# Scheduled motivation texts (morning + night)
-#
-# These are driven by the date recorded in state, not by a fire-once timer:
-# a free host that sleeps through the scheduled minute would silently skip an
-# APScheduler job, whereas here the bot notices on its next check that today's
-# text hasn't gone out yet and sends it (up to CATCHUP_HOURS late).
-# ---------------------------------------------------------------------------
-
-SCHEDULE_PROMPTS = {
-    "morning": (
-        "Write 1 short, simple morning motivation sentence for a day trader "
-        "(maximum 15 words). Focus on discipline or risk management, include "
-        "one emoji, no hashtags, no preamble — output the sentence text only."
-    ),
-    "night": (
-        "Write 1 short, simple evening wind-down sentence for a day trader "
-        "(maximum 15 words). Encourage rest or journaling, no revenge trading, "
-        "include one emoji, no hashtags, no preamble — output the sentence text only."
-    ),
-}
-
-SCHEDULE_FALLBACKS = {"morning": FALLBACK_MORNING, "night": FALLBACK_NIGHT}
-
-
-def generate_motivation(slot: str = "morning") -> str:
-    """Fresh motivation text via Gemini, with a static fallback (sync)."""
-    for model in GEMINI_MODELS:
-        try:
-            response = gemini_client.models.generate_content(
-                model=model, contents=SCHEDULE_PROMPTS[slot]
-            )
-            text = (response.text or "").strip()
-            if text:
-                return text
-        except Exception as error:  # noqa: BLE001 - fall through to next model
-            logger.warning("Model %s failed for %s text: %s", model, slot, error)
-    logger.info("Using a static fallback for the %s text", slot)
-    return random.choice(SCHEDULE_FALLBACKS[slot])
-
-
-async def broadcast_motivation(
-    context: ContextTypes.DEFAULT_TYPE, slot: str
-) -> None:
-    text = await asyncio.to_thread(generate_motivation, slot)
-    chats = list(state["chats"])
-    logger.info("Sending %s text to %d chat(s)", slot, len(chats))
-    for chat_id in chats:
-        await deliver(context, chat_id, text)
-
-
-async def scheduled_texts(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Periodic job: send any motivation text that is due and unsent today."""
-    if not state["chats"]:
-        return
-
-    now = datetime.now(local_timezone())
-    today = now.date().isoformat()
-
-    for slot, hour in (("morning", MORNING_HOUR), ("night", NIGHT_HOUR)):
-        if state["last_sent"].get(slot) == today:
-            continue
-        due = now.replace(hour=hour, minute=0, second=0, microsecond=0)
-        if now < due:
-            continue
-
-        # Record the attempt before sending: a delivery failure must not make
-        # the bot retry on every tick for the rest of the day.
-        state["last_sent"][slot] = today
-        save_state()
-
-        late = now - due
-        if late > timedelta(hours=CATCHUP_HOURS):
-            logger.info(
-                "Skipping the %s text for %s — %.1fh late (limit %sh)",
-                slot, today, late.total_seconds() / 3600, CATCHUP_HOURS,
-            )
-            continue
-
-        if late > timedelta(seconds=SCHEDULE_INTERVAL):
-            logger.info("Catching up on the %s text (%.1fh late)",
-                        slot, late.total_seconds() / 3600)
-        await broadcast_motivation(context, slot)
 
 
 # ---------------------------------------------------------------------------
@@ -951,12 +1090,21 @@ def chat_trades(chat_id: int) -> list[dict]:
 
 
 def describe_trade(trade: dict, index: int) -> str:
+    """One scannable line per trade — the glyph carries the status.
+
+    ⏳ waiting for entry · 🔴 running · 🔒 running, SL already moved to breakeven
+    """
     decimals = trade.get("decimals", 2)
-    status = "⏳ pending entry" if trade.get("status") == "pending" else "🔴 live"
+    if trade.get("status") == "pending":
+        glyph = "⏳"
+    else:
+        glyph = "🔒" if trade.get("be_alerted") else "🔴"
+    order = trade.get("order_type") or trade["direction"]
     return (
-        f"{index}. {trade['asset']} {trade['direction']} — {status}\n"
-        f"   entry {trade['entry']:.{decimals}f} · "
-        f"SL {trade['sl']:.{decimals}f} · TP {trade['tp']:.{decimals}f}"
+        f"{index}. {glyph} {trade['asset']} {order} · "
+        f"E {trade['entry']:.{decimals}f} · "
+        f"SL {trade['sl']:.{decimals}f} · "
+        f"TP {trade['tp']:.{decimals}f}"
     )
 
 
@@ -977,8 +1125,9 @@ async def list_trades(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     lines = [describe_trade(t, i) for i, t in enumerate(trades, start=1)]
     await message.reply_text(
-        "📋 Monitored trades:\n\n" + "\n".join(lines)
-        + "\n\nUse /cancel <number> to stop one, or /cancel all."
+        f"📋 {len(trades)} monitored — ⏳ pending · 🔴 live · 🔒 at breakeven\n"
+        + "\n".join(lines)
+        + "\n\n/cancel <number> · /cancel all"
     )
 
 
@@ -1024,29 +1173,6 @@ async def cancel_trade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
-async def send_motivation_now(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, slot: str
-) -> None:
-    """Generate and send one motivation text immediately, for testing."""
-    message = update.effective_message
-    register_chat(message.chat_id)
-    await context.bot.send_chat_action(
-        chat_id=message.chat_id, action=ChatAction.TYPING
-    )
-    text = await asyncio.to_thread(generate_motivation, slot)
-    await message.reply_text(text)
-
-
-async def motivate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/motivate — send the morning text now instead of waiting for it."""
-    await send_motivation_now(update, context, "morning")
-
-
-async def night(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/night — send the night text now instead of waiting for it."""
-    await send_motivation_now(update, context, "night")
-
-
 async def handle_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle an incoming chart image (photo or image file)."""
     message = update.effective_message
@@ -1081,10 +1207,25 @@ async def handle_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
             return
 
-        await message.reply_text(build_signal_message(data))
-
-        # Register the trade for live monitoring (Bybit, or Twelve Data for forex)
+        # Resolve the price feed before replying: its live price is what
+        # decides whether this is a market execution or a pending order, and
+        # it is a far better authority on that than a screenshot's price label.
         market = await resolve_market(data.asset)
+        live_price = None
+        if market:
+            async with httpx.AsyncClient(timeout=15) as http:
+                live_price = await fetch_market_price(http, market)
+
+        decimals = signal_decimals(data)
+        await message.reply_text(build_signal_message(data, live_price))
+
+        if data.position_count > 1:
+            await message.reply_text(
+                f"👀 I found {data.position_count} position tools on that chart "
+                "and read the most recent one (furthest right). Crop to a single "
+                "position if you meant a different one."
+            )
+
         if not market:
             await message.reply_text(
                 f"ℹ️ Live monitoring isn't available for {data.asset.upper()} "
@@ -1094,7 +1235,6 @@ async def handle_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             return
 
         symbol = market["symbol"]
-        decimals = signal_decimals(data)
 
         existing = find_duplicate_trade(message.chat_id, data, symbol)
         if existing:
@@ -1107,7 +1247,7 @@ async def handle_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
         be_price = breakeven_price(data)
         profit, loss = calculate_percentages(data)
-        fill = entry_fill_direction(data)
+        fill = entry_fill_direction(data, live_price)
         state["trades"].append({
             "chat_id": message.chat_id,
             "asset": data.asset.upper(),
@@ -1123,6 +1263,7 @@ async def handle_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "decimals": decimals,
             "profit_pct": profit,
             "loss_pct": loss,
+            "order_type": determine_order_type(data, live_price),
             # A pending order isn't a position yet — no TP/SL/breakeven alerts
             # until price actually touches the entry level.
             "status": "pending" if fill else "active",
@@ -1131,41 +1272,27 @@ async def handle_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         })
         save_state()
 
-        exec_note = ""
-        if broker_execution_enabled():
-            success, exec_msg = await execute_broker_order({
-                "asset": data.asset.upper(),
-                "symbol": symbol,
-                "direction": data.direction,
-                "entry": data.entry,
-                "sl": data.stop_loss,
-                "tp": data.take_profit,
-            })
-            exec_note = (
-                f"\n\n⚡ Broker Execution: {exec_msg}"
-                if success
-                else f"\n\n⚠️ Broker Execution: {exec_msg}"
-            )
-
-        cadence = ""
-
         if fill:
             expiry = (
                 f"\nMonitoring stops automatically after {TRADE_TTL_HOURS:g}h."
                 if TRADE_TTL_HOURS > 0 else ""
             )
+            away = "above" if fill == "up" else "below"
             await message.reply_text(
-                f"🔔 Pending order registered. I'll tell you when price "
-                f"reaches your entry at {data.entry:.{decimals}f}, then watch "
-                f"for breakeven ({be_price:.{decimals}f}), TP and SL."
-                f"{expiry}{cadence}{exec_note}"
+                f"⏳ Pending order — entry sits {away} the market"
+                + (f" ({live_price:.{decimals}f})" if live_price else "")
+                + f", so nothing is open yet. I'll tell you when price reaches "
+                f"{data.entry:.{decimals}f}, then watch for breakeven "
+                f"({be_price:.{decimals}f}), TP and SL.{expiry}"
             )
         else:
             await message.reply_text(
-                f"🔔 Trade is being monitored live.\n"
+                f"🔴 Market execution — entry is at the current price"
+                + (f" ({live_price:.{decimals}f})" if live_price else "")
+                + ", so I'm treating this as already open.\n"
                 f"I'll alert you to move SL to breakeven at "
                 f"{be_price:.{decimals}f} (30% of the way to TP), and again "
-                f"when TP or SL is hit.{cadence}{exec_note}"
+                "when TP or SL is hit."
             )
     except Exception as error:
         logger.exception("Failed to process chart")
@@ -1181,20 +1308,56 @@ async def handle_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
 
 
+# ---------------------------------------------------------------------------
+# Group chats
+#
+# The bot has never filtered on who sent a photo — any member's chart is
+# analysed. What silently blocks that is Telegram's *privacy mode*, which is
+# ON by default for every new bot: in a group it then only receives commands,
+# @mentions, and replies to its own messages, so other members' photos never
+# reach the bot at all. There is no Bot API call to change it (BotFather
+# only), but getMe reports the resulting permission, so the bot can at least
+# say so instead of looking broken.
+# ---------------------------------------------------------------------------
+
+PRIVACY_HINT = (
+    "⚠️ I can only see charts sent as a reply to me or with @mention in this "
+    "group.\n\nTo read every chart from every member, the bot owner needs to "
+    "turn privacy mode off:\n"
+    "1. Open @BotFather\n"
+    "2. /setprivacy → pick this bot → Disable\n"
+    "3. Remove me from the group and add me back (the change only takes "
+    "effect on re-join)"
+)
+
+# Set once at startup from getMe; None until then
+reads_all_group_messages: Optional[bool] = None
+
+
+def group_privacy_warning(update: Update) -> Optional[str]:
+    """PRIVACY_HINT if this is a group the bot can't fully see, else None."""
+    chat = update.effective_chat
+    if chat is None or chat.type not in ("group", "supergroup"):
+        return None
+    return None if reads_all_group_messages else PRIVACY_HINT
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     register_chat(update.effective_message.chat_id)
+    warning = group_privacy_warning(update)
     await update.effective_message.reply_text(
         "👋 Send me a screenshot of a trading chart with a long/short position "
         "tool drawn on it (entry, stop loss, take profit) and I'll reply with a "
         "formatted signal.\n\n"
-        "I'll also monitor the trade live: I tell you when a pending order "
-        "fills, when to move SL to breakeven at 30% of the way to TP, and "
-        "when TP/SL hits — plus a motivation text every morning 🌅 and "
-        "night 🌙.\n\n"
+        "If several positions are drawn, I read the most recent one — the "
+        "furthest right.\n\n"
+        "I check the live price to tell a market execution from a pending "
+        "LIMIT/STOP order, then monitor the trade: when a pending order fills, "
+        "when to move SL to breakeven at 30% of the way to TP, and when TP or "
+        "SL is hit.\n\n"
         "/trades — what I'm currently watching\n"
-        "/cancel — stop watching a trade\n"
-        "/motivate — morning text now\n"
-        "/night — night text now"
+        "/cancel — stop watching a trade"
+        + (f"\n\n{warning}" if warning else "")
     )
 
 
@@ -1202,17 +1365,34 @@ BOT_COMMANDS = [
     ("start", "How to use the bot"),
     ("trades", "List trades being monitored"),
     ("cancel", "Stop monitoring a trade"),
-    ("motivate", "Send the morning text now"),
-    ("night", "Send the night text now"),
 ]
 
 
 async def register_commands(app: Application) -> None:
-    """Populate the in-app command menu (best effort — never block startup)."""
+    """Populate the command menu and check group visibility (best effort)."""
+    global reads_all_group_messages
     try:
         await app.bot.set_my_commands(BOT_COMMANDS)
     except Exception:
         logger.warning("Could not set the bot command menu", exc_info=True)
+
+    try:
+        me = await app.bot.get_me()
+        reads_all_group_messages = bool(me.can_read_all_group_messages)
+    except Exception:
+        logger.warning("Could not read the bot's group permissions", exc_info=True)
+        return
+
+    if reads_all_group_messages:
+        logger.info("Privacy mode is OFF — every member's charts are visible in groups")
+    else:
+        logger.warning(
+            "Privacy mode is ON: in groups this bot only receives commands, "
+            "@mentions and replies to itself, so charts posted by other "
+            "members never reach it. Disable it in @BotFather "
+            "(/setprivacy -> Disable), then remove and re-add the bot to each "
+            "group for the change to take effect."
+        )
 
 
 def main() -> None:
@@ -1227,21 +1407,16 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("trades", list_trades))
     app.add_handler(CommandHandler("cancel", cancel_trade))
-    app.add_handler(CommandHandler("motivate", motivate))
-    app.add_handler(CommandHandler("night", night))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_chart))
 
-    # Background jobs: trade monitoring + the morning/night texts. Both are
-    # repeating checks rather than one-shot daily timers, so a missed window
-    # (host asleep, restart) is recovered instead of silently skipped.
+    # Each run samples the price range since the previous one, so a tick
+    # missed while the host slept is covered by the next one's lookback
+    # rather than lost.
     app.job_queue.run_repeating(monitor_trades, interval=MONITOR_INTERVAL, first=10)
-    app.job_queue.run_repeating(scheduled_texts, interval=SCHEDULE_INTERVAL, first=15)
 
-    tz = local_timezone()
     logger.info(
-        "Motivation texts: morning %02d:00, night %02d:00 (%s, now %s)",
-        MORNING_HOUR, NIGHT_HOUR, tz.key,
-        datetime.now(tz).strftime("%Y-%m-%d %H:%M"),
+        "Monitoring %d trade(s) every %ds on interval high/low",
+        len(state["trades"]), MONITOR_INTERVAL,
     )
     logger.info("Live prices: GoldAPI (spot metals) + Yahoo Finance (forex/indices/oil) + Bybit (crypto)")
 

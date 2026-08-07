@@ -1,5 +1,16 @@
 # Mobile MT5 Automated Trade Execution: Architecture & Roadmap
 
+> **STATUS: SHELVED (2026-08-07).** Automated broker execution is no longer
+> being worked on. `bot.py` no longer imports or calls `broker_api.py`, so no
+> chart can place an order — the `BROKER_*` environment variables have no
+> effect. `broker_api.py` and this document are kept for reference only.
+> Focus has moved to the bot's chart interpretation and trade monitoring.
+>
+> Note if this is ever resumed: the execution path was never given a lot-size
+> or risk model. It fell back to each provider's hardcoded default (0.01 lots
+> for Exness, 1000 units for OANDA), which is not a position size anyone
+> chose. That gap must be closed before it is wired back in.
+
 This document outlines the architectural options and step-by-step roadmap for allowing the Telegram Bot (`bot.py`, hosted on Render) to automatically execute trades extracted from trading chart screenshots so that positions appear instantly on your **MetaTrader 5 (MT5) Mobile App (iOS / Android)**.
 
 ---
