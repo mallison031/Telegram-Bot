@@ -1,7 +1,7 @@
 """Automated Trading Chart Vision Bot.
 
-Receives a chart screenshot on Telegram, extracts trade parameters with
-Gemini Flash vision, calculates profit/loss percentages in code (never
+Receives a chart screenshot on Telegram, extracts trade parameters with a
+vision model on Groq's free tier, calculates profit/loss percentages in code (never
 trusting the AI with math), and replies with a formatted signal:
 
     [ASSET] [ACTION] [ORDER_TYPE]
@@ -10,22 +10,26 @@ trusting the AI with math), and replies with a formatted signal:
     TP: [VALUE]
     Profit: +[X]% / Loss: -[Y]%
 
-Live trade monitoring (GoldAPI for spot metals, Yahoo Finance for
-forex/indices/oil, Bybit for crypto) alerts when a pending order fills, when
+Live trade monitoring (Swissquote for metals and forex, Yahoo Finance as the
+forex fallback, Coinbase for crypto) alerts when a pending order fills, when
 to move SL to breakeven once price covers 30% of the distance to TP, and on
 TP or SL. Chart assets are matched against each provider's real instrument
-list rather than a guessed suffix.
+list rather than a guessed suffix. Indices and oil are not monitored: no free
+feed tracks their CFD prices in real time.
 
-Levels are tested against the high and low of each polling interval, not the
-last traded price, so a wick through TP or SL between polls is still caught.
+Candle feeds are tested against each interval's high and low, so a wick
+through TP or SL between polls is still caught; quote feeds are polled every
+few seconds on the broker's own bid/ask.
 """
 
 import asyncio
+import base64
 import json
 import logging
 import os
 import random
 import re
+import secrets
 import time
 from datetime import datetime, timedelta
 from datetime import timezone as dt_timezone
@@ -34,13 +38,12 @@ from typing import Literal, NamedTuple, Optional
 
 import httpx
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types as genai_types
 from pydantic import BaseModel
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -50,7 +53,7 @@ from telegram.ext import (
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 
 # Optional settings
 STATE_FILE = Path(os.environ.get("STATE_FILE", "state.json"))
@@ -58,62 +61,83 @@ STATE_FILE = Path(os.environ.get("STATE_FILE", "state.json"))
 
 # Fraction of the entry->TP distance that triggers the breakeven alert
 BREAKEVEN_FRACTION = 0.30
-# How often to check live prices for active trades (seconds)
-MONITOR_INTERVAL = 60
+# How often to check live prices (seconds). Live-quote feeds (Swissquote:
+# metals, forex) are polled this often, because a quote is a single point and
+# polling is the only way to catch a short wick. Candle feeds (Coinbase,
+# Yahoo) already carry each minute's high/low, so they are polled every
+# CANDLE_FEED_INTERVAL instead. Each poll is one request per market, not per
+# trade: trade count barely affects the load, distinct symbols do.
+MONITOR_INTERVAL = float(os.environ.get("MONITOR_INTERVAL", "5"))
+CANDLE_FEED_INTERVAL = max(MONITOR_INTERVAL, 15)
+QUOTE_FEEDS = {"swissquote"}
+# Never wait longer than this for one market's prices, so a slow feed can't
+# stretch a cycle past MONITOR_INTERVAL (the scheduler skips a run that would
+# overlap the previous one)
+FEED_TIMEOUT = min(4, MONITOR_INTERVAL)
+# Markets fetched at once per cycle
+MAX_PARALLEL_FEEDS = 10
 # Drop a monitored trade after this many hours so stale setups don't pile up
 # (0 disables expiry)
 TRADE_TTL_HOURS = float(os.environ.get("TRADE_TTL_HOURS", "72"))
-# Entry within this fraction of the current price counts as a market order.
-# Deliberately tight (1 basis point). The two misreadings are not equally
-# costly: calling a market order "pending" is cheap, because price is already
-# sitting on the entry and the fill fires on the next poll a minute later.
-# Calling a limit order "market" is expensive — the bot believes you are in a
-# position you never opened and starts sending breakeven and TP/SL alerts for
-# it. So when in doubt, treat it as pending.
+# Entry within this fraction of the price on the CHART counts as a market
+# order (5 basis points: ~$2 on gold, ~5 pips on EURUSD). The chart is the
+# moment the trade was taken, so this can afford to be loose enough to absorb
+# the model misreading a label by a tick or two.
+CHART_MARKET_TOLERANCE = 0.0005
+# Entry within this fraction of the LIVE price counts as a market order. Only
+# used when the chart gives no reading at all. Deliberately tight (1 basis
+# point): by the time a chart arrives price has usually moved, so live price
+# alone can't tell a market trade taken a minute ago from a limit order, and
+# calling a limit order "market" sends alerts for a position never opened.
 MARKET_ORDER_TOLERANCE = 0.0001
 # Relative tolerance for treating a re-sent chart as the same trade
 DUPLICATE_TOLERANCE = 0.001
 
-BYBIT_TICKERS_URL = "https://api.bybit.com/v5/market/tickers"
-BYBIT_KLINE_URL = "https://api.bybit.com/v5/market/kline"
-# Bybit market categories to search for a pair, in order of preference:
-# linear = USDT perpetual futures (most leveraged pairs), spot = spot market
-BYBIT_CATEGORIES = ("linear", "spot")
+COINBASE_PRODUCTS_URL = "https://api.exchange.coinbase.com/products"
 
-# Tried in order — first one that responds wins. The newest Flash models on the
-# free tier intermittently return 503 (high demand), so we keep fallbacks.
-# Ordered by measured availability and latency on the free tier, not by
-# version number. Benchmarked with a real vision+schema call: 3.6-flash
-# answered in 2.7s and 3.1-flash-lite in 1.1s, while 3-flash-preview took
-# 29.8s and the rest returned 429 (quota exhausted) inside a second.
-# Exhausted models fail fast, so they cost almost nothing to skip and stay on
-# as fallbacks for when the quota window rolls over.
-GEMINI_MODELS = [
-    "gemini-3.6-flash",
-    "gemini-3.1-flash-lite",
-    "gemini-3-flash-preview",
-    "gemini-flash-latest",
-    "gemini-3.5-flash",
+# Groq's OpenAI-compatible endpoint. Free tier, no card: sign up at
+# console.groq.com and create a key.
+GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+# Tried in order — first one that responds wins. Groq currently serves a
+# single vision model; the list stays so another can be added as a fallback.
+# Free-tier limits for it: 30 requests/min, 1,000/day and 7,000 input
+# tokens/min. A chart costs ~3,500 tokens (the image alone is 2,048), so
+# about two charts a minute fit before Groq answers 429; extract_chart_analysis
+# then waits as long as Groq says and tries again.
+VISION_MODELS = [
+    "qwen/qwen3.8-27b",
 ]
 
-# When every model is busy the whole list is retried after a pause. Free-tier
-# 503s are explicitly temporary ("spikes in demand are usually temporary"), so
-# waiting a few seconds usually beats failing the user's chart outright.
-GEMINI_BACKOFF = (0, 4, 10)
+# When every model is busy the whole list is retried after a pause: as long
+# as Groq's 429 says the per-minute budget needs to free up, or else these
+# successive waits (the last repeats). Waiting beats failing the user's chart.
+VISION_BACKOFF = (4, 10, 20)
 # Never spend longer than this on one image, so a reply always arrives
-GEMINI_MAX_WAIT = 75
+VISION_MAX_WAIT = 75
 
 # Errors worth retrying: overloaded, rate-limited, or a transient server fault
-GEMINI_RETRY_CODES = (429, 500, 502, 503, 504)
+VISION_RETRY_CODES = (429, 500, 502, 503, 504)
+
+
+class VisionAPIError(Exception):
+    """A failed vision request, tagged with whether trying again could help."""
+
+    def __init__(
+        self, message: str, retryable: bool, retry_after: Optional[float] = None
+    ):
+        super().__init__(message)
+        self.retryable = retryable
+        # Seconds the API asked us to wait before retrying, when it said
+        self.retry_after = retry_after
 
 
 def is_retryable(error: Exception) -> bool:
-    """True if this Gemini failure is transient and worth another attempt."""
-    code = getattr(error, "code", None) or getattr(error, "status_code", None)
-    if isinstance(code, int):
-        return code in GEMINI_RETRY_CODES
-    text = str(error)
-    return any(str(c) in text for c in GEMINI_RETRY_CODES) or "UNAVAILABLE" in text
+    """True if this vision failure is transient and worth another attempt."""
+    if isinstance(error, VisionAPIError):
+        return error.retryable
+    # Timeouts and dropped connections
+    return isinstance(error, httpx.TransportError)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -121,8 +145,6 @@ logging.basicConfig(
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
-
-gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 
 # ---------------------------------------------------------------------------
@@ -150,8 +172,10 @@ def load_state() -> dict:
     for trade in data["trades"]:
         trade.setdefault("status", "active")
         trade.setdefault("created_at", now)
+        # Trades from before providers were recorded were all on Bybit, which
+        # monitor_trade now re-resolves to a live feed
         trade.setdefault("provider", "bybit")
-        trade.setdefault("category", "linear")
+        trade.pop("category", None)  # Bybit-only field
         trade.setdefault("fill_direction", None)
         trade.setdefault("be_alerted", False)
         trade.setdefault("decimals", 2)
@@ -183,7 +207,7 @@ def register_chat(chat_id: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Vision extraction (Gemini) — returns raw values only, no math, no prose
+# Vision extraction (Groq) — returns raw values only, no math, no prose
 # ---------------------------------------------------------------------------
 
 class ActivePosition(BaseModel):
@@ -200,7 +224,7 @@ class ActivePosition(BaseModel):
 
 
 class ChartAnalysis(BaseModel):
-    """Raw values Gemini extracts from the image. All math happens in code.
+    """Raw values the vision model extracts from the image. All math happens in code.
 
     is_trading_chart gates everything: when False the bot stays silent.
     """
@@ -308,64 +332,118 @@ itself the running one, leave active_position null.
 
 Extract only the raw values. Do NOT calculate anything. Do NOT write a message. \
 Return only the structured data.
-"""
+
+Respond with a single JSON object matching this JSON Schema, using null for any \
+value you cannot read:
+""" + json.dumps(ChartAnalysis.model_json_schema())
+
+
+def retry_after_seconds(response: httpx.Response, message: str) -> Optional[float]:
+    """How long a 429 asks us to wait: the retry-after header, else the
+    "Please try again in 6.5s" in Groq's message."""
+    try:
+        return float(response.headers["retry-after"])
+    except (KeyError, ValueError):
+        pass
+    match = re.search(r"try again in ([\d.]+)(ms|s)", message)
+    if not match:
+        return None
+    return float(match.group(1)) / (1000 if match.group(2) == "ms" else 1)
+
+
+def request_chart_analysis(
+    http: httpx.Client, model: str, image_url: str
+) -> ChartAnalysis:
+    """One vision request to Groq; raises VisionAPIError on any failure.
+
+    Groq's JSON mode guarantees syntactically valid JSON but not the schema,
+    so the reply is validated here and a mismatch is treated as retryable.
+    """
+    response = http.post(
+        GROQ_CHAT_URL,
+        headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+        json={
+            "model": model,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": VISION_PROMPT},
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                ],
+            }],
+            "response_format": {"type": "json_object"},
+            # Groq rejects JSON mode unless reasoning is hidden or parsed out
+            "reasoning_format": "hidden",
+            "temperature": 0,
+        },
+    )
+
+    if response.status_code != 200:
+        try:
+            detail = response.json().get("error") or {}
+        except ValueError:
+            detail = {}
+        message = detail.get("message") or response.text[:200]
+        # json_validate_failed is a 400, but it means the model produced
+        # malformed JSON this time — a fresh attempt usually succeeds.
+        retryable = (response.status_code in VISION_RETRY_CODES
+                     or detail.get("code") == "json_validate_failed")
+        raise VisionAPIError(
+            f"HTTP {response.status_code}: {message}", retryable,
+            retry_after=retry_after_seconds(response, message),
+        )
+
+    try:
+        content = response.json()["choices"][0]["message"]["content"]
+        return ChartAnalysis.model_validate_json(content)
+    except (KeyError, IndexError, TypeError, ValueError) as error:
+        # pydantic's ValidationError is a ValueError
+        raise VisionAPIError(f"Unusable reply: {error}", retryable=True) from error
 
 
 def extract_chart_analysis(image_bytes: bytes, mime_type: str) -> ChartAnalysis:
-    """Call Gemini vision with enforced structured JSON output (sync).
+    """Read a chart with a Groq vision model, as validated JSON (sync).
 
-    Tries each model in GEMINI_MODELS until one responds — free-tier models
-    intermittently return 503 (high demand) or 429 (quota).
+    Tries each model in VISION_MODELS until one responds — the free tier
+    returns 429 once the per-minute token budget is spent.
     """
-    deadline = time.monotonic() + GEMINI_MAX_WAIT
-    last_error: Exception | None = None
+    image_url = (
+        f"data:{mime_type};base64,{base64.b64encode(image_bytes).decode('ascii')}"
+    )
+    deadline = time.monotonic() + VISION_MAX_WAIT
 
-    for attempt, delay in enumerate(GEMINI_BACKOFF):
-        if delay:
-            if time.monotonic() + delay >= deadline:
+    with httpx.Client(timeout=30) as http:
+        for attempt in range(1, 100):
+            last_error: Exception | None = None
+            for model in VISION_MODELS:
+                try:
+                    analysis = request_chart_analysis(http, model, image_url)
+                except Exception as error:  # noqa: BLE001 - try the next model
+                    last_error = error
+                    if not is_retryable(error):
+                        # A bad key or malformed request won't fix itself
+                        logger.error("Model %s failed permanently: %s", model, error)
+                        raise
+                    logger.warning("Model %s busy (attempt %d): %s",
+                                   model, attempt, error)
+                    continue
+
+                if attempt > 1:
+                    logger.info("Model %s answered on attempt %d", model, attempt)
+                return analysis
+
+            # Every model is busy. Wait as long as the API asked — the free
+            # tier's per-minute token budget frees up on a schedule it states
+            # — padded a little, or else back off.
+            asked = getattr(last_error, "retry_after", None)
+            wait = (asked + 0.5 if asked
+                    else VISION_BACKOFF[min(attempt, len(VISION_BACKOFF)) - 1])
+            if time.monotonic() + wait >= deadline:
                 break
-            logger.info("All models busy, retrying in %ss", delay)
-            time.sleep(delay)
+            logger.info("All models busy, retrying in %.1fs", wait)
+            time.sleep(wait)
 
-        for model in GEMINI_MODELS:
-            try:
-                response = gemini_client.models.generate_content(
-                    model=model,
-                    contents=[
-                        genai_types.Part.from_bytes(
-                            data=image_bytes, mime_type=mime_type
-                        ),
-                        VISION_PROMPT,
-                    ],
-                    config=genai_types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        response_schema=ChartAnalysis,
-                        temperature=0,
-                    ),
-                )
-            except Exception as error:  # noqa: BLE001 - try the next model
-                last_error = error
-                if not is_retryable(error):
-                    # A bad key or malformed request won't fix itself
-                    logger.error("Model %s failed permanently: %s", model, error)
-                    raise
-                logger.warning("Model %s busy (attempt %d): %s",
-                               model, attempt + 1, error)
-                if time.monotonic() >= deadline:
-                    break
-                continue
-
-            if attempt:
-                logger.info("Model %s answered on attempt %d", model, attempt + 1)
-            parsed = response.parsed
-            if isinstance(parsed, ChartAnalysis):
-                return parsed
-            return ChartAnalysis.model_validate_json(response.text)
-
-        if time.monotonic() >= deadline:
-            break
-
-    raise last_error if last_error else RuntimeError("No Gemini model available")
+    raise last_error if last_error else RuntimeError("No vision model available")
 
 
 def to_trade_data(analysis: ChartAnalysis) -> Optional[TradeData]:
@@ -409,49 +487,43 @@ def breakeven_price(data: TradeData) -> float:
     return data.entry + (data.take_profit - data.entry) * BREAKEVEN_FRACTION
 
 
-def reference_price(data: TradeData, live_price: Optional[float] = None) -> Optional[float]:
-    """The price the entry is judged against to classify the order.
-
-    The live feed wins when we have it. Gemini reads the chart's own price
-    label well enough most of the time, but it is a screenshot of a moment
-    that has already passed, and when the label is small or occluded the model
-    returns null — which used to make every such setup look like a market
-    execution. The feed is both current and always numeric, so it decides;
-    the chart's reading is only the fallback for assets no feed carries.
-    """
-    if live_price is not None and live_price > 0:
-        return live_price
-    if data.current_price is not None and data.current_price > 0:
-        return data.current_price
-    return None
-
-
 def entry_fill_direction(
     data: TradeData, live_price: Optional[float] = None
 ) -> Optional[str]:
     """Which way price must travel to reach entry: 'up', 'down', or None.
 
-    None means the order executes immediately at market: entry sits on the
-    current price.
+    None means a market execution: the entry sat on the price when the trade
+    was taken, so the position is already open.
 
-    A numeric comparison against a real price wins when one is available.
-    Failing that we fall back to where the model *saw* the entry line sitting
-    relative to the last candle — judging which of two lines is higher is a
-    far easier visual task than reading both prices off the axis correctly,
-    and it is the only signal left for an asset no feed carries.
+    The chart decides first, because the screenshot is the moment the trade
+    was taken. Judging by the live price instead turned most market trades
+    into phantom pending orders: by the time a chart arrives, gold has moved
+    more than the 1-basis-point tolerance ($0.42), so the bot waited for price
+    to come back to an entry the user was already in — and when it ran
+    straight to TP, never sent the breakeven or TP alert at all.
+
+    In order: where the model saw the entry line sit against the last candle
+    (judging which line is higher is far more reliable than reading both
+    labels), then the chart's price label, then the live price.
     """
-    current = reference_price(data, live_price)
-    if current is not None:
-        if abs(data.entry - current) / data.entry < MARKET_ORDER_TOLERANCE:
-            return None
-        return "up" if data.entry > current else "down"
-
+    if data.entry_placement == "at":
+        return None
     if data.entry_placement == "above":
         return "up"
     if data.entry_placement == "below":
         return "down"
-    if data.entry_placement == "at":
-        return None
+
+    chart = data.current_price
+    if chart is not None and chart > 0:
+        if abs(data.entry - chart) / data.entry < CHART_MARKET_TOLERANCE:
+            return None
+        return "up" if data.entry > chart else "down"
+
+    if live_price is not None and live_price > 0:
+        if abs(data.entry - live_price) / data.entry < MARKET_ORDER_TOLERANCE:
+            return None
+        return "up" if data.entry > live_price else "down"
+
     # Nothing to compare against at all — assume pending rather than claim a
     # position is open. See MARKET_ORDER_TOLERANCE for why that way round.
     return "unknown"
@@ -575,20 +647,17 @@ def validate(data: TradeData) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Live prices: Bybit public API (no key, no account)
+# Live prices: Coinbase Exchange public API (no key, no account)
 #
-# Bybit names its pairs its own way: a chart labelled BTCUSD or XAUUSD is
-# BTCUSDT / XAUUSDT here. Rather than guess a suffix and hope, the bot
-# downloads Bybit's real symbol list per market category and matches against
-# it — the list is authoritative and catches renames and new listings.
-#
-# The list is only used to resolve a chart to a pair. Per-cycle pricing stays
-# a targeted per-symbol call, because the full linear ticker payload is ~550KB
-# and fetching that every minute would be absurd.
+# Coinbase names its products BASE-QUOTE: a chart labelled BTCUSD is BTC-USD
+# there. Candidates are probed one product at a time, and a 404 means
+# Coinbase doesn't list it. It carries crypto only — no metals, forex or
+# indices — and fewer coins than the derivatives exchanges.
 # ---------------------------------------------------------------------------
 
-# Cache the symbol list this long before refetching (seconds)
-BYBIT_SYMBOLS_TTL = 6 * 3600
+# Quote currencies a chart ticker can end in, longest first so that USDT
+# isn't read as USD followed by a stray T
+COINBASE_QUOTES = ("USDT", "USDC", "USD", "EUR", "GBP")
 
 # Never ask a provider for more than this much history in one poll. Bounds the
 # catch-up after the host has been asleep for hours.
@@ -615,6 +684,65 @@ class PriceSample(NamedTuple):
         return cls(price, price, price)
 
 
+class Candle(NamedTuple):
+    """One 1-minute candle: when it opened (epoch seconds), its high and low."""
+
+    start: float
+    high: float
+    low: float
+
+
+class PriceFeed(NamedTuple):
+    """A market's recent prices, fetched once per cycle and shared by every
+    trade on that market.
+
+    Each trade then takes only the candles since it was last checked, so
+    sharing one fetch never lets a trade see prices from before it existed.
+    """
+
+    last: float
+    candles: tuple[Candle, ...] = ()
+    # Live-quote feeds also carry the ask (`last` is then the bid)
+    ask: Optional[float] = None
+
+    def price_for(self, buying: bool) -> float:
+        """The side of the quote an order is filled or closed on."""
+        return self.ask if buying and self.ask is not None else self.last
+
+    def sample_since(
+        self, since: Optional[datetime], mark: Optional[float] = None
+    ) -> tuple[PriceSample, Optional[float]]:
+        """What price did since a trade's last check, and its new candle mark.
+
+        `mark` is the open time of the newest candle the previous check used.
+        Candles are taken from it onwards; it is re-read because it may still
+        have been forming then. Tracking candles rather than the clock matters
+        because feeds publish late: Yahoo leaves a minute's high/low null for
+        a while, and a clock cutoff advancing every few seconds would pass
+        that minute before it filled in and never test it at all.
+
+        Without a mark (a trade's first check), take the candle that was open
+        at `since` onwards — part of it may predate `since`, but dropping it
+        would miss what came after.
+        """
+        if mark is not None:
+            recent = [c for c in self.candles if c.start >= mark]
+        else:
+            cutoff = since.timestamp() - 60 if since else float("-inf")
+            recent = [c for c in self.candles if c.start > cutoff]
+        new_mark = max((c.start for c in recent), default=mark)
+
+        if not recent:
+            # A spot-only feed, or a market with no trades in the window
+            return PriceSample.point(self.last), new_mark
+        sample = PriceSample(
+            self.last,
+            max(self.last, *(c.high for c in recent)),
+            min(self.last, *(c.low for c in recent)),
+        )
+        return sample, new_mark
+
+
 def lookback_minutes(since: Optional[datetime], now: datetime) -> int:
     """How many 1-minute candles to request to cover the gap since `since`."""
     if since is None:
@@ -622,203 +750,178 @@ def lookback_minutes(since: Optional[datetime], now: datetime) -> int:
     gap = (now - since).total_seconds()
     return max(2, min(MAX_LOOKBACK_MINUTES, int(gap // 60) + 2))
 
-_bybit_symbols: dict[str, set[str]] = {}
-_bybit_symbols_at: dict[str, float] = {}
-
-
 def normalize_asset(asset: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", asset.upper())
 
 
-def bybit_symbol_candidates(asset: str) -> list[str]:
-    """Bybit pair names to try for an asset like 'BTCUSD' or 'XAUUSD'.
+# Quote currencies a symbol can end in, for recognising a pair under a suffix
+PAIR_QUOTES = ("USDT", "USDC", "USD", "EUR", "GBP", "JPY", "CHF", "AUD", "NZD",
+               "CAD", "ZAR", "TRY", "MXN", "SGD", "HKD", "NOK", "SEK", "PLN")
+# Account-type suffixes brokers append: Exness XAUUSDm / EURUSDc, US30.cash...
+BROKER_SUFFIXES = ("CASH", "MICRO", "MINI", "PRO", "RAW", "ECN", "M", "C", "I", "Z")
 
-    Order matters: the first candidate that Bybit actually lists wins.
+
+def canonical_asset(asset: str) -> str:
+    """The plain market symbol, with any broker account suffix removed.
+
+    A chart read off an Exness account says XAUUSDm, which matched no feed.
+    A suffix is only stripped when what remains is recognisably a pair or a
+    known index, so tickers that merely end in those letters (ETC) survive.
     """
     compact = normalize_asset(asset)
-    candidates = []
-
-    if compact.endswith("USDT"):
-        base = compact[:-4]
-        candidates.append(compact)
-    elif compact.endswith("USDC"):
-        base = compact[:-4]
-        candidates.append(compact)
-    elif compact.endswith("USD"):
-        base = compact[:-3]
-        # BTCUSD -> BTCUSDT is the usual perpetual; the plain USD pair exists
-        # for a few inverse contracts, so keep it as a second choice.
-        candidates.extend([compact + "T", compact])
-    else:
-        base = compact
-
-    candidates.extend([base + "USDT", base + "USDC"])
-    return [c for c in dict.fromkeys(candidates) if c]
+    for suffix in BROKER_SUFFIXES:
+        stem = compact[: -len(suffix)]
+        if compact.endswith(suffix) and stem and (
+            stem.endswith(PAIR_QUOTES) or stem in UNMONITORED_ASSETS
+        ):
+            return stem
+    return compact
 
 
-async def bybit_symbols(http: httpx.AsyncClient, category: str) -> set[str]:
-    """Every pair Bybit lists in a category, cached for BYBIT_SYMBOLS_TTL.
+def coinbase_symbol_candidates(asset: str) -> list[str]:
+    """Coinbase product IDs to try for an asset like 'BTCUSD' or 'ETHUSDT'.
 
-    Diagnostics only — resolution probes individual symbols instead, because
-    this payload is ~550KB and too slow to sit on the request path.
+    Order matters: the first product Coinbase actually lists wins. The chart's
+    own quote currency goes first, because USDT pairs trade at a small premium
+    to USD and the levels on the chart are priced in whichever it shows.
     """
-    cached = _bybit_symbols.get(category)
-    if cached and time.monotonic() - _bybit_symbols_at.get(category, 0) < BYBIT_SYMBOLS_TTL:
-        return cached
+    compact = canonical_asset(asset)
+    base, quote = compact, None
+    for candidate in COINBASE_QUOTES:
+        if compact.endswith(candidate) and len(compact) > len(candidate):
+            base, quote = compact[: -len(candidate)], candidate
+            break
 
-    try:
-        response = await http.get(BYBIT_TICKERS_URL, params={"category": category})
-        payload = response.json()
-    except (httpx.HTTPError, ValueError) as error:
-        logger.warning("Could not fetch the Bybit %s pair list: %s", category, error)
-        return cached or set()
-
-    if payload.get("retCode") != 0:
-        logger.warning("Bybit %s pair list returned retCode %s",
-                       category, payload.get("retCode"))
-        return cached or set()
-
-    names = {
-        row["symbol"]
-        for row in (payload.get("result") or {}).get("list") or []
-        if row.get("symbol")
-    }
-    if not names:
-        return cached or set()
-
-    _bybit_symbols[category] = names
-    _bybit_symbols_at[category] = time.monotonic()
-    logger.info("Bybit lists %d %s pairs", len(names), category)
-    return names
+    quotes = ([quote] if quote else []) + ["USD", "USDT", "USDC"]
+    return [f"{base}-{q}" for q in dict.fromkeys(quotes)]
 
 
-async def fetch_bybit_price(
-    http: httpx.AsyncClient, symbol: str, category: str
+async def fetch_coinbase_price(
+    http: httpx.AsyncClient, product: str
 ) -> Optional[float]:
-    """Last traded price for a Bybit symbol, or None if unavailable."""
+    """Last traded price for a Coinbase product, or None if unavailable."""
     try:
-        r = await http.get(
-            BYBIT_TICKERS_URL, params={"category": category, "symbol": symbol}
-        )
-        payload = r.json()
-    except (httpx.HTTPError, ValueError):
+        r = await http.get(f"{COINBASE_PRODUCTS_URL}/{product}/ticker")
+        # Unknown products answer 404 {"message": "NotFound"}
+        if r.status_code != 200:
+            return None
+        price = float(r.json()["price"])
+    except (httpx.HTTPError, KeyError, TypeError, ValueError):
         return None
-    # Bybit returns HTTP 200 even for unknown symbols; retCode signals success
-    if payload.get("retCode") != 0:
-        return None
-    tickers = (payload.get("result") or {}).get("list") or []
-    if not tickers:
-        return None
-    try:
-        return float(tickers[0]["lastPrice"])
-    except (KeyError, ValueError):
-        return None
+    return price if price > 0 else None
 
 
-async def fetch_bybit_sample(
-    http: httpx.AsyncClient, symbol: str, category: str, minutes: int
-) -> Optional[PriceSample]:
-    """High/low/close over the last `minutes` 1-minute candles on Bybit."""
+async def fetch_coinbase_feed(
+    http: httpx.AsyncClient, product: str, minutes: int
+) -> Optional[PriceFeed]:
+    """The last `minutes` of 1-minute candles on Coinbase."""
+    end = datetime.now(dt_timezone.utc)
+    start = end - timedelta(minutes=minutes)
     try:
         r = await http.get(
-            BYBIT_KLINE_URL,
+            f"{COINBASE_PRODUCTS_URL}/{product}/candles",
             params={
-                "category": category,
-                "symbol": symbol,
-                "interval": "1",
-                "limit": minutes,
+                "granularity": 60,
+                "start": start.isoformat(),
+                "end": end.isoformat(),
             },
         )
-        payload = r.json()
+        rows = r.json() if r.status_code == 200 else []
     except (httpx.HTTPError, ValueError):
-        return None
-    if payload.get("retCode") != 0:
-        return None
+        rows = []
 
-    # Rows are [start_ms, open, high, low, close, volume, turnover], newest first
-    rows = (payload.get("result") or {}).get("list") or []
-    highs, lows = [], []
+    # Rows are [time, low, high, open, close, volume], newest first
+    candles = []
     last: Optional[float] = None
-    for row in rows:
+    for row in rows if isinstance(rows, list) else []:
         try:
-            high, low, close = float(row[2]), float(row[3]), float(row[4])
+            start, low, high, close = (
+                float(row[0]), float(row[1]), float(row[2]), float(row[4])
+            )
         except (IndexError, TypeError, ValueError):
             continue
         if last is None:
             last = close
-        highs.append(high)
-        lows.append(low)
+        candles.append(Candle(start, high, low))
 
     if last is None:
-        # Klines unavailable (a brand-new listing, say) — fall back to the
-        # ticker so the trade is still checked, just without wick coverage.
-        price = await fetch_bybit_price(http, symbol, category)
-        return PriceSample.point(price) if price else None
-    return PriceSample(last, max(highs), min(lows))
+        # Coinbase publishes no candle for a minute without trades, so a quiet
+        # pair can come back empty — fall back to the ticker so the trade is
+        # still checked, just without wick coverage.
+        price = await fetch_coinbase_price(http, product)
+        return PriceFeed(price) if price else None
+    return PriceFeed(last, tuple(candles))
 
 
 # ---------------------------------------------------------------------------
-# Live prices: Gold API (public spot metals — keyless, no account needed)
+# Live prices: Swissquote public quotes (keyless, no account needed)
 #
-# Covers real spot gold (XAUUSD -> XAU) and spot silver (XAGUSD -> XAG).
-# Free, unmetered public JSON API: https://api.gold-api.com/price/{symbol}
+# Real-time bid/ask from a regulated broker for spot metals (XAU/USD,
+# XAG/USD, XPT/USD...) and forex pairs (EUR/USD, GBP/JPY, USD/ZAR...).
+# Quotes are under a second old. It publishes no candles, so it is sampled
+# point by point — but every few seconds, and on the same bid/ask a broker
+# fills and closes on, which matters more for gold than candle coverage on a
+# feed that doesn't match the broker's price. (gold-api.com, the previous
+# metals feed, refreshed only every 30 s and sat ~$1.30 off broker quotes.)
 # ---------------------------------------------------------------------------
 
-GOLDAPI_BASE_URL = "https://api.gold-api.com/price"
+SWISSQUOTE_QUOTES_URL = (
+    "https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument"
+)
+
+SWISSQUOTE_ALIASES = {"GOLD": "XAU/USD", "XAU": "XAU/USD",
+                      "SILVER": "XAG/USD", "XAG": "XAG/USD"}
 
 
-def goldapi_symbol_candidates(asset: str) -> list[str]:
-    compact = normalize_asset(asset)
-    if compact in ("XAUUSD", "GOLD", "XAU"):
-        return ["XAU"]
-    if compact in ("XAGUSD", "SILVER", "XAG"):
-        return ["XAG"]
+def swissquote_symbol_candidates(asset: str) -> list[str]:
+    """Swissquote instrument names to try, e.g. 'XAUUSD' -> 'XAU/USD'."""
+    compact = canonical_asset(asset)
+    if compact in SWISSQUOTE_ALIASES:
+        return [SWISSQUOTE_ALIASES[compact]]
+    if len(compact) == 6 and compact.isalpha():
+        return [f"{compact[:3]}/{compact[3:]}"]
     return []
 
 
-async def fetch_goldapi_price(
-    http: httpx.AsyncClient, symbol: str
-) -> Optional[float]:
-    """Current spot price for XAU (Gold) or XAG (Silver) from gold-api.com."""
+async def fetch_swissquote_quote(
+    http: httpx.AsyncClient, instrument: str
+) -> Optional[tuple[float, float]]:
+    """Live (bid, ask) for a Swissquote instrument, or None if unavailable."""
     try:
-        response = await http.get(
-            f"{GOLDAPI_BASE_URL}/{symbol.upper()}",
-            headers={"User-Agent": "Mozilla/5.0"},
-        )
-        if response.status_code != 200:
+        r = await http.get(f"{SWISSQUOTE_QUOTES_URL}/{instrument}")
+        if r.status_code != 200:
             return None
-        payload = response.json()
-        price = float(payload["price"])
-        return price if price > 0 else None
-    except (httpx.HTTPError, KeyError, ValueError, TypeError) as error:
-        logger.warning("GoldAPI price check failed for %s: %s", symbol, error)
-        return None
+        # One entry per liquidity platform, each with a few spread profiles.
+        # An unknown instrument answers with an empty list.
+        for platform in r.json():
+            for prices in platform.get("spreadProfilePrices") or []:
+                bid, ask = float(prices["bid"]), float(prices["ask"])
+                if 0 < bid <= ask:
+                    return bid, ask
+    except (httpx.HTTPError, KeyError, TypeError, ValueError, AttributeError):
+        pass
+    return None
+
+
+async def fetch_swissquote_price(
+    http: httpx.AsyncClient, instrument: str
+) -> Optional[float]:
+    """Live bid — the price charts plot — for a Swissquote instrument."""
+    quote = await fetch_swissquote_quote(http, instrument)
+    return quote[0] if quote else None
 
 
 # ---------------------------------------------------------------------------
 # Live prices: Yahoo Finance (public market data — keyless, no account needed)
 #
-# Covers forex pairs (EURUSD=X), indices (^DJI, ^GSPC, ^IXIC, ^GDAXI, ^FTSE),
-# and commodities/oil (CL=F, BZ=F).
+# A fallback for forex pairs Swissquote doesn't quote (EURUSD=X), and stocks.
+# Not used for indices or oil any more — see UNMONITORED_ASSETS.
 # ---------------------------------------------------------------------------
 
 def yahoo_symbol_candidates(asset: str) -> list[str]:
-    """Yahoo Finance symbol names to try for an asset like 'EURUSD' or 'US30'."""
-    compact = normalize_asset(asset)
+    """Yahoo Finance symbol names to try for an asset like 'EURUSD' or 'AAPL'."""
+    compact = canonical_asset(asset)
     candidates = []
-
-    # Indices & Commodities
-    index_map = {
-        "US30": "^DJI", "DJI": "^DJI", "DOW": "^DJI",
-        "US500": "^GSPC", "SPX500": "^GSPC", "SPX": "^GSPC", "SP500": "^GSPC",
-        "US100": "^IXIC", "NAS100": "^IXIC", "NASDAQ": "^IXIC",
-        "GER40": "^GDAXI", "GER30": "^GDAXI", "DAX": "^GDAXI",
-        "UK100": "^FTSE", "FTSE": "^FTSE",
-        "USOIL": "CL=F", "WTI": "CL=F",
-        "UKOIL": "BZ=F", "BRENT": "BZ=F",
-    }
-    if compact in index_map:
-        candidates.append(index_map[compact])
 
     # Forex pairs (e.g., EURUSD -> EURUSD=X)
     if len(compact) == 6 and compact.isalpha():
@@ -831,14 +934,23 @@ def yahoo_symbol_candidates(asset: str) -> list[str]:
 
 
 async def fetch_yahoo_chart(
-    http: httpx.AsyncClient, symbol: str
+    http: httpx.AsyncClient, symbol: str, minutes: int = 2
 ) -> Optional[dict]:
-    """Raw 1-minute chart payload for a Yahoo Finance symbol."""
+    """Raw 1-minute chart payload for a Yahoo Finance symbol.
+
+    Asks for just the last `minutes` rather than the whole day: ~1.5KB
+    instead of ~57KB, which matters at a poll every few seconds.
+    """
     url = f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}"
+    end = int(time.time())
     try:
         r = await http.get(
             url,
-            params={"interval": "1m", "range": "1d"},
+            params={
+                "interval": "1m",
+                "period1": end - minutes * 60,
+                "period2": end,
+            },
             headers={"User-Agent": "Mozilla/5.0"},
         )
         if r.status_code != 200:
@@ -862,11 +974,11 @@ async def fetch_yahoo_price(
     return price if price > 0 else None
 
 
-async def fetch_yahoo_sample(
+async def fetch_yahoo_feed(
     http: httpx.AsyncClient, symbol: str, minutes: int
-) -> Optional[PriceSample]:
-    """High/low/last over the last `minutes` 1-minute candles on Yahoo."""
-    result = await fetch_yahoo_chart(http, symbol)
+) -> Optional[PriceFeed]:
+    """The last `minutes` of 1-minute candles on Yahoo."""
+    result = await fetch_yahoo_chart(http, symbol, minutes)
     if not result:
         return None
 
@@ -877,53 +989,79 @@ async def fetch_yahoo_sample(
     if last <= 0:
         return None
 
+    # Outside market hours the window holds no candles at all; the last price
+    # alone is still a valid (if range-less) reading.
     try:
         quote = result["indicators"]["quote"][0]
-        highs = [h for h in (quote.get("high") or [])[-minutes:] if h]
-        lows = [low for low in (quote.get("low") or [])[-minutes:] if low]
-    except (KeyError, IndexError, TypeError):
-        highs, lows = [], []
-
-    # The quote arrays go quiet outside market hours; the last price alone is
-    # still a valid (if range-less) reading.
-    if not highs or not lows:
-        return PriceSample.point(last)
-    return PriceSample(last, max(max(highs), last), min(min(lows), last))
+        rows = zip(result.get("timestamp") or [],
+                   quote.get("high") or [], quote.get("low") or [])
+        candles = tuple(
+            Candle(float(start), float(high), float(low))
+            for start, high, low in rows
+            if high and low  # a minute with no trades is null
+        )
+    except (KeyError, IndexError, TypeError, ValueError):
+        candles = ()
+    return PriceFeed(last, candles)
 
 
 # ---------------------------------------------------------------------------
-# Provider routing: Yahoo Finance for metals/forex/indices/oil, Bybit for crypto
+# Provider routing: Swissquote for metals/forex, Yahoo Finance as the forex
+# fallback, Coinbase for crypto
 # ---------------------------------------------------------------------------
+
+# Bump when routing changes: trades stamped with an older version are moved
+# onto whichever feed now carries their asset (see tidy_trade).
+FEED_VERSION = 2
+
+# Index and oil CFDs have no free real-time feed. Yahoo's cash indices (^DJI,
+# ^IXIC...) only move during NYSE hours — frozen for ~70% of the day while the
+# CFD trades on — and sit hundreds of points off the CFD price; its futures
+# (YM=F, CL=F...) are ~10 minutes delayed. Watching either produced silence or
+# wrong alerts, so these are refused outright and the user is told why.
+UNMONITORED_ASSETS = {
+    "US30", "DJ30", "DJI", "DOW", "WS30", "YM",
+    "US500", "SPX500", "SPX", "SP500", "ES",
+    "US100", "NAS100", "USTEC", "NASDAQ", "NDX", "NQ",
+    "GER40", "GER30", "DE40", "DE30", "DAX", "UK100", "FTSE",
+    "JP225", "JPN225", "NIKKEI", "HK50", "AUS200", "FRA40", "EU50", "STOXX50",
+    "USOIL", "WTI", "XTIUSD", "UKOIL", "BRENT", "XBRUSD", "NGAS", "XNGUSD",
+}
+
+UNMONITORED_REASON = (
+    "there's no free real-time price feed for indices and oil, and a delayed "
+    "or off-hours one would send wrong alerts"
+)
+
+
+def unmonitored_reason(asset: str) -> Optional[str]:
+    """Why an asset is deliberately not monitored, or None if it may be."""
+    if canonical_asset(asset) in UNMONITORED_ASSETS:
+        return UNMONITORED_REASON
+    return None
+
 
 async def resolve_market(asset: str) -> Optional[dict]:
     """Pick where to source live prices for a charted asset.
 
-    GoldAPI goes first for spot metals: Gold/Silver (XAUUSD, XAGUSD).
-    Yahoo Finance goes next for traditional markets: forex pairs, stock indices, and oil.
-    Bybit goes next: it covers crypto (BTCUSD, ETHUSD, SOLUSD...).
+    Swissquote goes first for spot metals and forex: live broker bid/ask.
+    Yahoo Finance goes next for forex pairs Swissquote lacks, and stocks.
+    Coinbase goes last: it covers crypto (BTCUSD, ETHUSD, SOLUSD...).
     """
+    if unmonitored_reason(asset):
+        return None
     async with httpx.AsyncClient(timeout=20) as http:
-        for candidate in goldapi_symbol_candidates(asset):
-            if await fetch_goldapi_price(http, candidate) is not None:
-                return {"provider": "goldapi", "symbol": candidate}
+        for candidate in swissquote_symbol_candidates(asset):
+            if await fetch_swissquote_price(http, candidate) is not None:
+                return {"provider": "swissquote", "symbol": candidate}
 
         for candidate in yahoo_symbol_candidates(asset):
             if await fetch_yahoo_price(http, candidate) is not None:
                 return {"provider": "yahoo", "symbol": candidate}
 
-        # Ask Bybit about each candidate directly rather than downloading the
-        # whole ticker table. The full linear list is ~550KB and takes ~9s on
-        # a good connection, which times out on a free-tier host and silently
-        # rejects every asset; a single-symbol probe is ~1KB and answers in
-        # milliseconds. Bybit is still the authority on whether a pair exists.
-        for candidate in bybit_symbol_candidates(asset):
-            for category in BYBIT_CATEGORIES:
-                if await fetch_bybit_price(http, candidate, category) is not None:
-                    return {
-                        "provider": "bybit",
-                        "symbol": candidate,
-                        "category": category,
-                    }
+        for candidate in coinbase_symbol_candidates(asset):
+            if await fetch_coinbase_price(http, candidate) is not None:
+                return {"provider": "coinbase", "symbol": candidate}
     return None
 
 
@@ -932,37 +1070,31 @@ async def fetch_market_price(
 ) -> Optional[float]:
     """Current price for a resolved market, whichever provider carries it."""
     provider = market["provider"]
-    if provider == "bybit":
-        return await fetch_bybit_price(
-            http, market["symbol"], market.get("category", "linear")
-        )
-    if provider == "goldapi":
-        return await fetch_goldapi_price(http, market["symbol"])
+    if provider == "coinbase":
+        return await fetch_coinbase_price(http, market["symbol"])
+    if provider == "swissquote":
+        return await fetch_swissquote_price(http, market["symbol"])
     if provider == "yahoo":
         return await fetch_yahoo_price(http, market["symbol"])
     return None
 
 
-async def fetch_trade_sample(
-    http: httpx.AsyncClient, trade: dict, minutes: int
-) -> Optional[PriceSample]:
-    """What price did over the last `minutes` for a monitored trade."""
-    provider = trade.get("provider", "bybit")
-    if provider == "bybit":
-        return await fetch_bybit_sample(
-            http, trade["symbol"], trade.get("category", "linear"), minutes
-        )
+async def fetch_feed(
+    http: httpx.AsyncClient, provider: str, symbol: str, minutes: int
+) -> Optional[PriceFeed]:
+    """The last `minutes` of prices for one market, whichever provider has it."""
+    if provider == "coinbase":
+        return await fetch_coinbase_feed(http, symbol, minutes)
     if provider == "yahoo":
-        return await fetch_yahoo_sample(http, trade["symbol"], minutes)
-    if provider == "goldapi":
-        # gold-api.com publishes a spot price and nothing else — no OHLC
-        # endpoint — so spot metals are the one feed still sampled pointwise
-        # and can miss a wick that reverses inside the polling interval.
-        price = await fetch_goldapi_price(http, trade["symbol"])
-        return PriceSample.point(price) if price else None
+        return await fetch_yahoo_feed(http, symbol, minutes)
+    if provider == "swissquote":
+        # A quote, not candles: sampled point by point, so a wick that
+        # reverses between two polls (a few seconds) can still slip past.
+        quote = await fetch_swissquote_quote(http, symbol)
+        return PriceFeed(quote[0], ask=quote[1]) if quote else None
     logger.warning(
-        "Trade on %s uses retired provider %r — it will expire on its own",
-        trade.get("asset"), provider,
+        "Market %s uses retired provider %r — its trades will expire on "
+        "their own", symbol, provider,
     )
     return None
 
@@ -1057,30 +1189,31 @@ async def deliver(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str) -
         logger.exception("Could not deliver message to chat %s", chat_id)
 
 
-def trade_watched_since(trade: dict, now: datetime) -> Optional[datetime]:
-    """When this trade was last checked — the start of the interval to sample.
+def trade_window_start(trade: dict) -> Optional[datetime]:
+    """Where the next check's price window starts for this trade.
 
-    Bounding the lookback to the time we have actually been watching matters:
-    a trade registered a minute ago must not be resolved by a wick from an
-    hour before it existed.
+    That is the newest candle the last check used, or — before any candle has
+    been seen — the moment the trade was registered. Never the clock time of
+    the last check: candles publish late, and a window that moves with the
+    clock would slide past a minute before its high/low appeared.
+
+    Bounding it to the time we have actually been watching matters too: a
+    trade registered a minute ago must not be resolved by a wick from an hour
+    before it existed.
     """
-    for key in ("checked_at", "created_at"):
-        try:
-            return datetime.fromisoformat(trade[key])
-        except (KeyError, TypeError, ValueError):
-            continue
-    return None
+    if trade.get("candle_mark") is not None:
+        return datetime.fromtimestamp(trade["candle_mark"], dt_timezone.utc)
+    try:
+        return datetime.fromisoformat(trade["created_at"])
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
-async def monitor_trade(
-    context: ContextTypes.DEFAULT_TYPE,
-    http: httpx.AsyncClient,
-    trade: dict,
-    now: datetime,
-) -> None:
-    """Check one trade against the price range since it was last checked."""
+async def tidy_trade(
+    context: ContextTypes.DEFAULT_TYPE, trade: dict, now: datetime
+) -> bool:
+    """Expire or migrate a trade before pricing; False if it was dropped."""
     trades = state["trades"]
-    decimals = trade.get("decimals", 2)
 
     if trade_expired(trade, now):
         trades.remove(trade)
@@ -1091,26 +1224,71 @@ async def monitor_trade(
             f"{TRADE_TTL_HOURS:g}h. Re-send the chart if the setup is "
             "still valid.",
         )
-        return
+        return False
 
-    # Self-healing: upgrade any legacy futures gold/silver trade to spot metals
-    if trade.get("provider") == "yahoo" and trade.get("symbol") in ("GC=F", "SI=F"):
-        trade["provider"] = "goldapi"
-        trade["symbol"] = "XAU" if trade["symbol"] == "GC=F" else "XAG"
+    # Self-healing: a trade registered under older feed routing (Bybit,
+    # GoldAPI, Yahoo indices...) is moved once onto whichever feed carries its
+    # asset now, or dropped with a message if none does.
+    if trade.get("feed_version") != FEED_VERSION:
+        market = await resolve_market(trade["asset"])
+        if market is None:
+            trades.remove(trade)
+            save_state()
+            reason = (unmonitored_reason(trade["asset"])
+                      or "no price feed lists it any more")
+            await deliver(
+                context, trade["chat_id"],
+                f"⚠️ Stopped monitoring {trade['asset']} — {reason}.",
+            )
+            return False
+        if (market["provider"], market["symbol"]) != (
+                trade.get("provider"), trade.get("symbol")):
+            logger.info("Moved %s from %s %s to %s %s", trade["asset"],
+                        trade.get("provider"), trade.get("symbol"),
+                        market["provider"], market["symbol"])
+            trade["provider"] = market["provider"]
+            trade["symbol"] = market["symbol"]
+            trade.pop("candle_mark", None)  # belonged to the old feed
+        trade["feed_version"] = FEED_VERSION
         save_state()
 
-    minutes = lookback_minutes(trade_watched_since(trade, now), now)
-    sample = await fetch_trade_sample(http, trade, minutes)
-    if sample is None:
-        return
+    return True
 
-    # Only advance the watermark once a reading actually came back, so an
-    # outage doesn't blind the bot to what price did while the feed was down.
-    trade["checked_at"] = now.isoformat()
+
+async def apply_feed(
+    context: ContextTypes.DEFAULT_TYPE,
+    trade: dict,
+    feed: PriceFeed,
+) -> None:
+    """Check one trade against what its market did since it was last checked."""
+    trades = state["trades"]
+    decimals = trade.get("decimals", 2)
+    since = trade_window_start(trade)
+    pending = trade.get("status") == "pending"
+    if feed.ask is not None:
+        # A live quote: test the side the broker uses. Buying fills on the ask
+        # and selling on the bid — a pending BUY fills, and an open SELL
+        # closes (SL or TP), when the ask gets there. Charts plot the bid, so
+        # a short's SL is otherwise hit on the broker a spread before the
+        # chart shows it.
+        buying = (trade["direction"] == "LONG") == pending
+        sample, mark = PriceSample.point(feed.price_for(buying)), None
+    else:
+        sample, mark = feed.sample_since(since, trade.get("candle_mark"))
+
+    # Only advance the mark once a reading actually came back, so an outage
+    # doesn't blind the bot to what price did while the feed was down.
+    if mark is not None:
+        trade["candle_mark"] = mark
 
     event = check_trade(trade, sample)
     if event is None:
-        save_state()
+        if pending and trade.get("fill_direction") is None:
+            # Which side of the market entry sits on was never established.
+            # check_trade can only fill such an order on a sample that spans
+            # entry, which a single quote never does — so settle the side now
+            # from where price actually is, and the next touch fills it.
+            trade["fill_direction"] = "up" if trade["entry"] > sample.last else "down"
         return
 
     if event == "entry":
@@ -1124,10 +1302,10 @@ async def monitor_trade(
         trades.remove(trade)
         text = (
             f"🚪 {trade['asset']}: price reached TP "
-            f"({trade['tp']:.{decimals}f}) without ever filling your "
-            f"entry at {trade['entry']:.{decimals}f}. The setup played "
-            "out without you — no loss taken. Missing a trade costs "
-            "nothing; chasing one does. 🧠"
+            f"({trade['tp']:.{decimals}f}) without coming back to your "
+            f"entry at {trade['entry']:.{decimals}f}, so a pending order "
+            "there never filled — no loss taken.\n"
+            "If you were actually already in this trade, it just hit TP 🎯"
         )
     elif event == "breakeven":
         trade["be_alerted"] = True
@@ -1149,33 +1327,107 @@ async def monitor_trade(
         )
 
     logger.info(
-        "%s %s -> %s (last %s, range %s-%s over %dm)",
+        "%s %s -> %s (last %s, range %s-%s since %s)",
         trade["asset"], trade["direction"], event.upper(),
-        sample.last, sample.low, sample.high, minutes,
+        sample.last, sample.low, sample.high,
+        since.strftime("%H:%M:%S") if since else "start",
     )
+    # Saved before sending, so a crash between the two can't repeat the alert
     save_state()
     await deliver(context, trade["chat_id"], text)
 
 
+async def fetch_feeds(
+    http: httpx.AsyncClient, wanted: dict[tuple[str, str], int]
+) -> dict[tuple[str, str], Optional[PriceFeed]]:
+    """Fetch every market at once, each bounded by FEED_TIMEOUT.
+
+    A market that errors or times out maps to None: its trades are skipped
+    this cycle and their watermark stays put, so the next cycle covers the gap.
+    """
+    limit = asyncio.Semaphore(MAX_PARALLEL_FEEDS)
+
+    async def one(provider: str, symbol: str, minutes: int) -> Optional[PriceFeed]:
+        async with limit:
+            try:
+                return await asyncio.wait_for(
+                    fetch_feed(http, provider, symbol, minutes), FEED_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                logger.warning("%s %s took over %ss, skipped this cycle",
+                               provider, symbol, FEED_TIMEOUT)
+            except Exception:
+                logger.exception("Price fetch failed for %s %s", provider, symbol)
+            return None
+
+    results = await asyncio.gather(
+        *(one(provider, symbol, minutes)
+          for (provider, symbol), minutes in wanted.items())
+    )
+    return dict(zip(wanted, results))
+
+
+# When each market was last polled (time.monotonic())
+_last_polled: dict[tuple[str, str], float] = {}
+
+
 async def monitor_trades(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Periodic job: check live prices for all monitored trades."""
+    """Periodic job: check live prices for all monitored trades.
+
+    Prices are fetched once per market, not per trade, and all markets at
+    once. Fetching trade by trade made a cycle as slow as the sum of every
+    request; with a few slow feeds it overran the interval, and the scheduler
+    then skipped whole cycles rather than run two at the same time.
+    """
     if not state["trades"]:
         return
 
     now = datetime.now(dt_timezone.utc)
 
-    async with httpx.AsyncClient(timeout=15) as http:
-        for trade in list(state["trades"]):
-            # One bad trade must not abort the cycle for everyone else's.
-            # Without this an unexpected key or a malformed price silently
-            # stopped every alert in every chat, on every tick, for good.
-            try:
-                await monitor_trade(context, http, trade, now)
-            except Exception:
-                logger.exception(
-                    "Monitoring failed for %s in chat %s",
-                    trade.get("asset"), trade.get("chat_id"),
-                )
+    # One bad trade must not abort the cycle for everyone else's. Without
+    # this an unexpected key or a malformed price silently stopped every
+    # alert in every chat, on every tick, for good.
+    for trade in list(state["trades"]):
+        try:
+            await tidy_trade(context, trade, now)
+        except Exception:
+            logger.exception("Housekeeping failed for %s in chat %s",
+                             trade.get("asset"), trade.get("chat_id"))
+
+    # How far back each market needs to reach: its longest-unchecked trade.
+    # Only markets due a poll are fetched; the rest keep their marks and
+    # catch up next time.
+    clock = time.monotonic()
+    wanted: dict[tuple[str, str], int] = {}
+    for trade in state["trades"]:
+        key = (trade.get("provider"), trade.get("symbol"))
+        every = MONITOR_INTERVAL if key[0] in QUOTE_FEEDS else CANDLE_FEED_INTERVAL
+        # A little slack so a tick landing a hair early doesn't skip a poll
+        if clock - _last_polled.get(key, float("-inf")) < every - 1:
+            continue
+        minutes = lookback_minutes(trade_window_start(trade), now)
+        wanted[key] = max(wanted.get(key, 0), minutes)
+    if not wanted:
+        return
+    for key in wanted:
+        _last_polled[key] = clock
+
+    async with httpx.AsyncClient(timeout=FEED_TIMEOUT) as http:
+        feeds = await fetch_feeds(http, wanted)
+
+    for trade in list(state["trades"]):
+        feed = feeds.get((trade.get("provider"), trade.get("symbol")))
+        # No feed, or /cancel removed the trade while prices were in flight
+        if feed is None or trade not in state["trades"]:
+            continue
+        try:
+            await apply_feed(context, trade, feed)
+        except Exception:
+            logger.exception("Monitoring failed for %s in chat %s",
+                             trade.get("asset"), trade.get("chat_id"))
+
+    # Persist the advanced watermarks once per cycle, not once per trade
+    save_state()
 
 
 # ---------------------------------------------------------------------------
@@ -1226,6 +1478,90 @@ def describe_trade(trade: dict, index: int) -> str:
         f"SL {trade['sl']:.{decimals}f} · "
         f"TP {trade['tp']:.{decimals}f}"
     )
+
+
+def monitoring_status_text(trade: dict) -> str:
+    """How the bot is treating a trade, for the reply under its signal."""
+    decimals = trade.get("decimals", 2)
+    entry = f"{trade['entry']:.{decimals}f}"
+    be_price = f"{trade['be_price']:.{decimals}f}"
+    if trade.get("status") == "pending":
+        where = {"up": " — entry sits above the market",
+                 "down": " — entry sits below the market"}.get(
+                     trade.get("fill_direction"), "")
+        expiry = (
+            f"\nMonitoring stops automatically after {TRADE_TTL_HOURS:g}h."
+            if TRADE_TTL_HOURS > 0 else ""
+        )
+        return (
+            f"⏳ Pending order{where}, so nothing is open yet. I'll tell you "
+            f"when price reaches {entry}, then watch for breakeven "
+            f"({be_price}), TP and SL.{expiry}"
+        )
+    return (
+        "🔴 Treating this as open now — entry was at the market price.\n"
+        f"I'll alert you to move SL to breakeven at {be_price} (30% of the "
+        "way to TP), and again when TP or SL is hit."
+    )
+
+
+def correction_buttons(trade: dict) -> Optional[InlineKeyboardMarkup]:
+    """One tap to fix a wrong market/pending guess.
+
+    The bot can only infer from a screenshot whether the trade was taken at
+    market or left as a pending order, and a wrong guess silences every alert
+    that follows: a market trade read as pending waits for an entry that
+    already happened.
+    """
+    if not trade.get("id"):
+        return None
+    if trade.get("status") == "pending":
+        button = InlineKeyboardButton(
+            "✅ I'm already in this trade", callback_data=f"in:{trade['id']}")
+    else:
+        button = InlineKeyboardButton(
+            "⏳ It's a pending order", callback_data=f"wait:{trade['id']}")
+    return InlineKeyboardMarkup([[button]])
+
+
+async def correct_trade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Button handler: switch a trade between open and pending."""
+    query = update.callback_query
+    action, _, trade_id = (query.data or "").partition(":")
+    chat_id = query.message.chat_id if query.message else None
+    trade = next(
+        (t for t in state["trades"]
+         if t.get("id") == trade_id and t["chat_id"] == chat_id),
+        None,
+    )
+    if trade is None:
+        await query.answer("That trade isn't being monitored any more.")
+        return
+
+    side = "SELL" if trade["direction"] == "SHORT" else "BUY"
+    if action == "in" and trade.get("status") == "pending":
+        trade["status"] = "active"
+        trade["order_type"] = f"{side} MARKET"
+    elif action == "wait" and trade.get("status") != "pending":
+        trade["status"] = "pending"
+        trade["order_type"] = side
+        trade["be_alerted"] = False
+        # Settled from the next price reading (see apply_feed)
+        trade["fill_direction"] = None
+    else:
+        await query.answer()  # a double tap: already in that state
+        return
+
+    save_state()
+    logger.info("%s in chat %s corrected to %s",
+                trade["asset"], chat_id, trade["status"])
+    await query.answer("Updated ✅")
+    try:
+        await query.edit_message_text(
+            monitoring_status_text(trade), reply_markup=correction_buttons(trade)
+        )
+    except Exception:  # noqa: BLE001 - the state change is what matters
+        logger.warning("Could not update the status message", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1347,9 +1683,9 @@ async def handle_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
             return
 
-        # Resolve the price feed before replying: its live price is what
-        # decides whether this is a market execution or a pending order, and
-        # it is a far better authority on that than a screenshot's price label.
+        # Resolve the price feed before replying. The chart decides whether
+        # this is a market execution or a pending order; the live price is
+        # the fallback for a chart that gives no reading (entry_fill_direction).
         market = await resolve_market(data.asset)
         live_price = None
         if market:
@@ -1364,10 +1700,10 @@ async def handle_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await message.reply_text(context_note)
 
         if not market:
+            reason = unmonitored_reason(data.asset) or "no price feed lists it"
             await message.reply_text(
                 f"ℹ️ Live monitoring isn't available for {data.asset.upper()} "
-                f"— no price feed lists it, so breakeven/TP/SL alerts are off "
-                f"for this trade."
+                f"— {reason}. Breakeven/TP/SL alerts are off for this trade."
             )
             return
 
@@ -1385,12 +1721,13 @@ async def handle_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         be_price = breakeven_price(data)
         profit, loss = calculate_percentages(data)
         fill = entry_fill_direction(data, live_price)
-        state["trades"].append({
+        trade = {
+            # Lets the correction buttons find this trade again
+            "id": secrets.token_hex(4),
             "chat_id": message.chat_id,
             "asset": data.asset.upper(),
             "provider": market["provider"],
             "symbol": symbol,
-            "category": market.get("category", "linear"),
             "direction": data.direction,
             "entry": data.entry,
             "sl": data.stop_loss,
@@ -1408,32 +1745,14 @@ async def handle_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             # entry sits on; check_trade then fills on any touch either way.
             "fill_direction": fill if fill in ("up", "down") else None,
             "created_at": utcnow_iso(),
-        })
+            "feed_version": FEED_VERSION,
+        }
+        state["trades"].append(trade)
         save_state()
 
-        if fill:
-            expiry = (
-                f"\nMonitoring stops automatically after {TRADE_TTL_HOURS:g}h."
-                if TRADE_TTL_HOURS > 0 else ""
-            )
-            where = {"up": " — entry sits above the market",
-                     "down": " — entry sits below the market"}.get(fill, "")
-            await message.reply_text(
-                f"⏳ Pending order{where}"
-                + (f" ({live_price:.{decimals}f})" if live_price else "")
-                + f", so nothing is open yet. I'll tell you when price reaches "
-                f"{data.entry:.{decimals}f}, then watch for breakeven "
-                f"({be_price:.{decimals}f}), TP and SL.{expiry}"
-            )
-        else:
-            await message.reply_text(
-                f"🔴 Market execution — entry is at the current price"
-                + (f" ({live_price:.{decimals}f})" if live_price else "")
-                + ", so I'm treating this as already open.\n"
-                f"I'll alert you to move SL to breakeven at "
-                f"{be_price:.{decimals}f} (30% of the way to TP), and again "
-                "when TP or SL is hit."
-            )
+        await message.reply_text(
+            monitoring_status_text(trade), reply_markup=correction_buttons(trade)
+        )
     except Exception as error:
         logger.exception("Failed to process chart")
         if is_retryable(error):
@@ -1491,10 +1810,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "formatted signal.\n\n"
         "If several positions are drawn, I read the most recent one — the "
         "furthest right.\n\n"
-        "I check the live price to tell a market execution from a pending "
-        "LIMIT/STOP order, then monitor the trade: when a pending order fills, "
-        "when to move SL to breakeven at 30% of the way to TP, and when TP or "
-        "SL is hit.\n\n"
+        "I read from the chart whether you're in at market or waiting on a "
+        "pending LIMIT/STOP order (one tap fixes it if I guess wrong), then "
+        "monitor the trade: when a pending order fills, when to move SL to "
+        "breakeven at 30% of the way to TP, and when TP or SL is hit.\n\n"
         "/trades — what I'm currently watching\n"
         "/cancel — stop watching a trade"
         + (f"\n\n{warning}" if warning else "")
@@ -1562,19 +1881,21 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("trades", list_trades))
     app.add_handler(CommandHandler("cancel", cancel_trade))
+    app.add_handler(CallbackQueryHandler(correct_trade, pattern=r"^(in|wait):"))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_chart))
     app.add_error_handler(on_error)
 
     # Each run samples the price range since the previous one, so a tick
     # missed while the host slept is covered by the next one's lookback
-    # rather than lost.
+    # rather than lost. A run that would overlap a still-running one is
+    # skipped by the scheduler, which FEED_TIMEOUT keeps from happening.
     app.job_queue.run_repeating(monitor_trades, interval=MONITOR_INTERVAL, first=10)
 
     logger.info(
-        "Monitoring %d trade(s) every %ds on interval high/low",
+        "Monitoring %d trade(s) every %gs on interval high/low",
         len(state["trades"]), MONITOR_INTERVAL,
     )
-    logger.info("Live prices: GoldAPI (spot metals) + Yahoo Finance (forex/indices/oil) + Bybit (crypto)")
+    logger.info("Live prices: Swissquote (metals/forex) + Yahoo Finance (forex fallback) + Coinbase (crypto)")
 
     # On Render (and similar hosts) RENDER_EXTERNAL_URL is set automatically:
     # run in webhook mode so incoming Telegram messages wake the free service.

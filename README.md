@@ -1,6 +1,6 @@
 # Trading Chart Vision Bot
 
-A Telegram bot that reads trading chart screenshots with Gemini Flash vision,
+A Telegram bot that reads trading chart screenshots with a free vision model on Groq,
 extracts the trade setup (entry, stop loss, take profit), calculates profit/loss
 percentages in code, and replies with a formatted signal:
 
@@ -12,9 +12,10 @@ TP: 60361.53
 Profit: +5.02% / Loss: -0.26%
 ```
 
-The order type is not decorative: the bot checks the **live price** to tell a
-`MARKET` execution (position open now) from a pending `LIMIT`/`STOP` (nothing
-open until price reaches your entry), and monitors each accordingly.
+The order type is not decorative: the bot reads from the chart whether it's a
+`MARKET` execution (position open now) or a pending `LIMIT`/`STOP` (nothing
+open until price reaches your entry), monitors each accordingly, and gives you
+one tap to correct it if it guessed wrong.
 
 See `telegram_bot_roadmap.md` for the full design. Automated broker execution
 is shelved — see the status note in `MT5_MOBILE_AUTOMATION.md`.
@@ -24,8 +25,8 @@ is shelved — see the status note in `MT5_MOBILE_AUTOMATION.md`.
 1. **Create the Telegram bot** — message [@BotFather](https://t.me/BotFather),
    send `/newbot`, follow the prompts, and copy the HTTP API token.
 
-2. **Get a Gemini API key (free tier)** — go to
-   [Google AI Studio](https://aistudio.google.com/apikey) and create an API key.
+2. **Get a Groq API key (free tier, no card)** — sign up at
+   [console.groq.com](https://console.groq.com/keys) and create an API key.
 
 3. **Configure credentials** — put both keys in a `.env` file in the project
    root (never commit this file; it is gitignored):
@@ -90,14 +91,18 @@ drawn on it — you'll get the formatted signal back in a few seconds.
   TP/SL), the bot tells you it's running and gives its levels, on top of the
   signal for the most recent setup. That one is *not* monitored — send it as
   its own chart if you want alerts for it too.
-- **Market execution vs pending order** — the bot fetches the **live price**
-  and compares it to your entry. Entry sitting on the market is a market
-  execution (`BUY MARKET` / `SELL MARKET`), monitored as already open. Entry
-  away from the market is a pending `LIMIT` or `STOP` that isn't a position
-  yet, so the bot stays quiet about breakeven/TP/SL until price actually
-  touches your entry, then tells you the order should be filled. If price
-  runs to TP without ever filling, it says the setup played out without you
-  instead of claiming a win you never took.
+- **Market execution vs pending order** — read from the **chart**: an entry
+  line sitting on the latest candle is a market execution (`BUY MARKET` /
+  `SELL MARKET`), monitored as already open, even if price has moved since the
+  screenshot. Entry away from the market is a pending `LIMIT` or `STOP` that
+  isn't a position yet, so the bot stays quiet about breakeven/TP/SL until
+  price actually touches your entry, then tells you the order should be
+  filled. If price runs to TP without ever filling, it says so — and, in case
+  you were in after all, that it hit TP.
+- **One tap to correct it** — the message under each signal carries a button:
+  `✅ I'm already in this trade` on a pending order, `⏳ It's a pending order`
+  on an open one. A wrong guess silences every alert that follows, so fixing
+  it shouldn't mean re-sending the chart.
 - **TP and SL alerts catch wicks** — levels are tested against the **high and
   low of every polling interval**, not the last traded price, so a spike that
   tags your stop and snaps back inside the same minute still counts. When one
@@ -123,43 +128,67 @@ The command menu is registered with Telegram automatically at startup.
 
 | Instruments | Provider | Sampling | Needs |
 | --- | --- | --- | --- |
-| Spot Gold & Silver (`XAUUSD`, `XAGUSD`) | GoldAPI (`gold-api.com`) | spot price every 60 s | nothing |
-| Forex, Indices, Oil (`EURUSD`, `US30`, `USOIL`…) | Yahoo Finance | 1-min high/low | nothing |
-| Crypto (`BTCUSD`, `ETHUSD`, `SOLUSD`…) | Bybit | 1-min high/low | nothing |
+| Metals (`XAUUSD`, `XAGUSD`, `XPTUSD`…) | Swissquote | live bid/ask every 5 s | nothing |
+| Forex (`EURUSD`, `GBPJPY`, `USDZAR`…) | Swissquote (Yahoo Finance fallback) | live bid/ask every 5 s | nothing |
+| Crypto (`BTCUSD`, `ETHUSD`, `SOLUSD`…) | Coinbase | 1-min high/low every 15 s | nothing |
+| Indices, oil (`US30`, `NAS100`, `USOIL`…) | — **not monitored** | — | see below |
 
-> **Metals are the one gap.** `gold-api.com` publishes a spot price and nothing
-> else — it has no OHLC endpoint — so `XAUUSD` and `XAGUSD` are still sampled
-> pointwise once a minute and can miss a TP/SL wick that reverses within that
-> minute. Every other instrument gets true interval high/low and cannot miss one.
+All feeds are public, keyless and free:
+- **Swissquote** (a regulated broker) publishes live bid/ask quotes, under a
+  second old, for metals and forex. Buys are checked on the ask and sells on
+  the bid — the sides a broker fills and closes on — so a short's SL is caught
+  when your broker would hit it, not a spread later when the chart shows it.
+  It publishes no candles, so a wick that reverses between two 5 s polls can
+  still slip past.
+- **Yahoo Finance** is the fallback for forex pairs Swissquote doesn't quote.
+- **Coinbase** covers crypto (`BTCUSD` -> `BTC-USD`) with 1-minute candles, so
+  no wick is missed. It lists spot pairs only, so coins that trade solely as
+  perpetuals on derivatives exchanges aren't covered.
+- Charts no provider carries still get a signal; they just don't get
+  breakeven/TP/SL alerts, and the bot says why.
 
-The providers work together automatically with **zero required broker credentials or API keys**:
-- **GoldAPI** is checked first for spot metals (`XAUUSD` -> `XAU`, `XAGUSD` -> `XAG`). This uses real-time spot prices rather than COMEX futures so your Stop Loss and Take Profit levels match spot CFD broker charts exactly.
-- **Yahoo Finance** is checked next for traditional markets, covering forex pairs (`EURUSD=X`), major stock indices (`^DJI`, `^GSPC`, `^IXIC`, `^GDAXI`), and oil (`CL=F`, `BZ=F`).
-- **Bybit** is keyless and unmetered, handling crypto (`BTCUSD`, `ETHUSD`...) and spot CFD fallbacks.
-- Charts neither provider carries still get a signal; they just don't get breakeven/TP/SL alerts.
+> **Why indices and oil aren't monitored.** No free feed tracks index or oil
+> CFD prices in real time. Yahoo's cash indices (`^DJI`, `^IXIC`…) only move
+> during NYSE hours — frozen for ~70% of the day while `US30` trades on — and
+> sit hundreds of points off the CFD price; its futures (`YM=F`, `CL=F`) are
+> ~10 minutes delayed. Watching them produced silence or wrong alerts, so the
+> bot now says up front that these charts get no alerts. A free OANDA practice
+> account would provide real-time index and oil CFD prices if this is needed.
+
+(The previous metals feed, `gold-api.com`, refreshed only every 30 s and sat
+~$1.30 off broker quotes; trades saved under any retired feed move to the
+current one automatically.)
 
 #### How a chart maps to a market symbol
 
-- For spot metals, the bot maps `XAUUSD`/`GOLD` to `XAU` and `XAGUSD`/`SILVER` to `XAG` on `gold-api.com`.
-- For other traditional assets, the bot maps chart tickers to public Yahoo Finance symbols (e.g. `US30` -> `^DJI`, `EURUSD` -> `EURUSD=X`).
-- For crypto, Bybit names pairs its own way: a chart labelled `BTCUSD` is `BTCUSDT` there. Rather than guess a suffix, the bot probes Bybit's API to confirm the live ticker exists.
+- Broker account suffixes are stripped first: Exness's `XAUUSDm` or
+  `EURUSDc`, `US30.cash`. Only when what remains is recognisably a pair, so a
+  ticker like `ETC` is left alone.
+- Metals and forex become Swissquote instruments: `XAUUSD`/`GOLD` -> `XAU/USD`,
+  `GBPJPY` -> `GBP/JPY`. Yahoo's fallback name is `EURUSD=X`.
+- For crypto, Coinbase names products `BASE-QUOTE`: a chart labelled `BTCUSD` is `BTC-USD` there. The chart's own quote currency is tried first (`ETHUSDT` -> `ETH-USDT`, since USDT trades at a small premium to USD), then `USD`, `USDT` and `USDC`; the bot probes each until Coinbase confirms the product exists.
 
 ## How it works
 
 - **The bot responds to chart images and its own commands only.** Text
   messages get no reply, and images that aren't a trading chart with a
-  position tool are silently ignored (Gemini classifies each image before
-  extraction).
+  position tool are silently ignored (the vision model classifies each image
+  before extraction).
 - `bot.py` polls Telegram for messages. Photos (and image files) are downloaded
-  and sent to **Gemini Flash** with a prompt describing how to read a
+  and sent to **Groq** (`qwen/qwen3.8-27b`) with a prompt describing how to read a
   TradingView-style position tool (red box = stop loss, green/blue box = take
   profit, the line between = entry).
-- The model is picked from a fallback list in `bot.py` (`GEMINI_MODELS`) —
-  newest Flash first, older ones as backup — because free-tier models
-  occasionally return "high demand" errors.
-- Gemini is forced to return **structured JSON only** (asset, direction,
-  entry, SL, TP, current price, how many position tools it saw) via a response
-  schema — it never writes the final message and never does math.
+- The model comes from a list in `bot.py` (`VISION_MODELS`). Groq currently
+  serves one vision model; the free tier allows 30 requests/min, 1,000/day and
+  7,000 input tokens/min, and a chart costs ~3,500 tokens, so about **two
+  charts a minute** go straight through. Past that Groq answers 429 with how
+  long to wait; the bot waits exactly that long and retries, for up to 75 s,
+  so a burst of three charts all get answered (the last in ~45 s) instead of
+  the third failing.
+- The model is forced into **JSON mode** and given the `ChartAnalysis` schema
+  (asset, direction, entry, SL, TP, current price, how many position tools it
+  saw). The reply is validated against that schema, and a mismatch is retried
+  — it never writes the final message and never does math.
 - **Which position gets read.** The prompt tells the model to judge recency by
   where each position tool's box *starts* on the time axis and to take the
   right-most one, ignoring every other tool and drawing on the chart. It also
@@ -170,45 +199,52 @@ The providers work together automatically with **zero required broker credential
 - The backend **calculates the percentages deterministically** (per the roadmap
   formulas), classifies the order, validates that the setup is coherent, and
   formats the reply.
-- **The live feed classifies the order, not the screenshot.** Before replying,
-  the bot resolves the asset's price feed and fetches the current price, then
-  compares it to the entry. Gemini reads the chart's own price label well
-  enough most of the time, but that label is a moment that has already passed,
-  and when it's small or occluded the model returns null — which used to make
-  every such setup look like a market execution. Entry within
-  `MARKET_ORDER_TOLERANCE` of the live price is a market execution and starts
-  **live**; anything else is a pending `LIMIT`/`STOP` that starts **pending**
-  and waits for price to reach entry before any breakeven/TP/SL alert can fire.
+- **The screenshot classifies the order, not the live price.** The chart is
+  the moment the trade was taken, so it decides, in this order:
+  1. where the model **saw** the entry line sit against the latest candle —
+     on it (market), above or below it (pending). Judging which of two lines
+     is higher is far more reliable than reading both labels and subtracting;
+  2. the chart's price label: entry within `CHART_MARKET_TOLERANCE` (5 basis
+     points, ~$2 on gold) is a market execution;
+  3. only if the chart gives neither, the live price, within
+     `MARKET_ORDER_TOLERANCE` (1 basis point).
 
-  The tolerance is deliberately tight (1 basis point) because the two
-  misreadings don't cost the same. Calling a market order "pending" is cheap —
-  price is already on the entry, so the fill fires on the next poll a minute
-  later. Calling a limit order "market" is expensive: the bot believes you're
-  in a position you never opened and starts sending breakeven and TP/SL alerts
-  for it. When in doubt it treats the order as pending.
-
-  If no feed carries the asset, the model's **visual** read decides instead —
-  it reports whether the entry line sits above, below, or on the current price
-  level. Judging which of two lines is higher is far more reliable than reading
-  both prices off the axis and subtracting. With neither signal the bot names
-  the side but not the order type, rather than guessing `LIMIT` vs `STOP`.
-- **Monitoring samples ranges, not points.** Every 60 s a background job asks
-  each provider for the 1-minute candles covering the time since that trade
-  was last checked, and tests TP/SL/breakeven against the interval's high and
-  low. Comparing only the last traded price meant a level counted solely if
+  The live price used to decide first, and it turned most market trades into
+  phantom pending orders: by the time a chart arrives, gold has moved more
+  than 1 basis point ($0.42), so the bot waited for price to return to an
+  entry you were already in — and when price ran to TP, never sent the
+  breakeven or TP alert at all. With no signal anywhere the bot names the
+  side but not the order type, rather than guessing `LIMIT` vs `STOP`, and
+  settles which side of the market the entry sits on from the first price
+  reading.
+- **Monitoring samples ranges, not points.** Every 15 s a background job asks
+  each candle provider (Coinbase, Yahoo) for the 1-minute candles
+  covering the time since that trade was last checked, and tests
+  TP/SL/breakeven against the interval's high and low. Comparing only the last traded price meant a level counted solely if
   price was still beyond it at the instant of the poll, so wicks were invisible
   and trades ran on past their stops. The lookback is bounded by the trade's
   own `created_at`, so a wick from before you sent the chart can't resolve it,
   and capped at `MAX_LOOKBACK_MINUTES` (180) so waking from a long sleep
-  doesn't request a day of history.
+  doesn't request a day of history. Each trade remembers the newest candle it
+  has used and picks up from there, rather than from the clock time of its
+  last check: Yahoo publishes a minute's high/low late, and a window moving
+  with a 15 s clock would slide past that minute before it filled in.
+- **One request per market, all markets at once.** Trades are grouped by
+  symbol, so ten trades on `BTC-USD` cost one request, and every market is
+  fetched in parallel with a `FEED_TIMEOUT` (10 s) cap each. The number of
+  trades has no limit; a cycle takes as long as the slowest single feed, not
+  the sum of all of them. (Checking trades one at a time used to let a few
+  slow feeds overrun the interval, and the scheduler then silently skipped
+  whole cycles.) A feed that fails or times out only delays its own trades,
+  which catch up on the next cycle.
 - **One bad trade can't silence the rest.** Each trade is checked inside its
   own `try`, because an unexpected key used to raise mid-loop and abort the
   cycle for every trade in every chat, every minute, indefinitely.
-- **Pair resolution** downloads Bybit's full symbol list per market category
-  (cached 6 h) and matches the chart's asset against it, preferring `linear`
-  (USDT perpetuals) over `spot`. Per-cycle pricing then uses a targeted
-  single-symbol call, because the full linear ticker payload is ~550 KB and
-  fetching that every minute would be wasteful.
+- **Pair resolution** probes each candidate pair with a single-symbol price
+  call, in provider order (Swissquote, Yahoo, Coinbase); the first that
+  answers is the trade's feed. Trades saved under older routing (Bybit,
+  GoldAPI, Yahoo indices) are moved to the current feed automatically on the
+  next monitoring cycle, or dropped with a message saying why.
 
 ## How the Telegram side works
 
@@ -226,7 +262,7 @@ You (Telegram app)                Telegram servers                 This bot
        |                                 |--------------------------->|
        |                                 |  3. getFile + download     |
        |                                 |<---------------------------|
-       |                                 |       (bot sends image to Gemini,
+       |                                 |       (bot sends image to Groq,
        |                                 |        does the math locally)
        |                                 |  4. sendMessage (signal)   |
        |                                 |<---------------------------|
@@ -268,7 +304,7 @@ You (Telegram app)                Telegram servers                 This bot
   sender, but Telegram's privacy mode stops most of them ever reaching it.
 - **Photos vs. files:** Telegram re-compresses photos to JPEG; sending the
   screenshot as a *file/document* preserves full quality, which can help
-  Gemini read small price labels. The bot accepts both.
+  the model read small price labels. The bot accepts both.
 
 ## Reading every member's charts in a group
 
@@ -314,7 +350,7 @@ The bot has two modes, picked automatically:
      build command `pip install -r requirements.txt`, start command
      `python bot.py`, instance type **Free**.
 3. When prompted, set the environment variables:
-   - `TELEGRAM_BOT_TOKEN`, `GEMINI_API_KEY` — required
+   - `TELEGRAM_BOT_TOKEN`, `GROQ_API_KEY` — required
    - live prices need no key — every feed the bot uses is public
 4. Deploy. Once live, the bot registers its own webhook with Telegram —
    no manual webhook setup needed. Send `/start` to the bot to confirm.
@@ -373,11 +409,15 @@ add:
    slept — but only up to that cap, so set up the uptime pinger.
 3. **Was it still pending?** A `⏳` trade has not filled, and pending orders
    deliberately get no TP/SL alerts until price touches your entry.
-4. **Is it gold or silver?** `gold-api.com` has no OHLC endpoint, so metals are
-   sampled pointwise and a wick that reverses inside the minute can be missed.
-   Everything else is checked on interval high/low and cannot miss one.
-5. **Check the logs.** Every event logs its sample, e.g.
-   `XAUUSD SHORT -> SL (last 4310.93, range 4309.82-4310.93 over 2m)`. A trade
+4. **Was it read as pending when you were already in (or the reverse)?** The
+   message under the signal says which; tap its button to correct it.
+5. **Is it gold, silver or forex?** Swissquote publishes quotes, not candles,
+   so a wick that reverses between 5 s polls can be missed. Crypto is checked
+   on 1-minute high/low and cannot miss one.
+6. **Is it an index or oil?** These aren't monitored at all — the bot says so
+   when you send the chart.
+7. **Check the logs.** Every event logs its sample, e.g.
+   `XAUUSD SHORT -> SL (last 4310.93, range 4309.82-4310.93 since 09:41:00)`. A trade
    that keeps failing logs `Monitoring failed for <asset> in chat <id>` with a
    traceback each cycle, without affecting any other trade.
 
@@ -391,7 +431,9 @@ position tool. If two start at nearly the same point the model can pick the
 other one — crop the screenshot to the setup you mean. When it sees more than
 one tool it tells you how many it found.
 
-**A trade says monitoring is unavailable.** No feed lists that asset symbol. Make sure the asset is a standard ticker symbol (e.g. `XAUUSD`, `EURUSD`, `US30`, `BTCUSD`).
+**A trade says monitoring is unavailable.** Either it's an index or oil (not
+monitored, see *Which assets can be monitored*), or no feed lists that symbol —
+make sure the chart shows a standard ticker (e.g. `XAUUSD`, `EURUSD`, `BTCUSD`).
 
 ### Updating the bot
 
