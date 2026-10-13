@@ -474,10 +474,20 @@ To keep trades through restarts, set `UPSTASH_REDIS_REST_URL` and
 [console.upstash.com](https://console.upstash.com) → your database → REST API).
 The bot then loads its state from Upstash at startup and saves to it in the
 background whenever a trade changes — not on every price poll, so it stays far
-inside the free 500K requests a month. If Upstash can't be read at startup,
-the bot refuses to write to it for that run, so a network blip can never
-replace your stored trades with an empty list (with `ADMIN_CHAT_ID` set, the
-start-up notice tells you).
+inside the free 500K requests a month. Use the **normal** REST token, not the
+read-only one: at startup the bot checks it can write, and if it can't, the
+start-up notice says so (with `ADMIN_CHAT_ID` set) instead of silently losing
+every save. If Upstash can't be read at startup, the bot refuses to write to
+it for that run, so a network blip can never replace your stored trades with
+an empty list.
+
+**Deploys are safe.** Render starts the new copy of the bot before stopping
+the old one, so for a minute or two both run. Each trade and each result is
+stored separately, and a copy only writes what it changed, so neither copy
+can erase a trade the other registered. Every 20 s each copy picks up trades
+the other added, changed or closed, and an alert is sent by whichever copy
+claims it first in Upstash — never twice. `/stats` reads results from Upstash,
+so results recorded by either copy count.
 
 ### Optional extras
 

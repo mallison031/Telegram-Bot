@@ -193,28 +193,104 @@ def upstash(command: list) -> object:
     return response.json().get("result")
 
 
+def upstash_pipeline(commands: list[list]) -> list:
+    """Run several commands in one request; their results, or raises.
+
+    Upstash answers a pipeline with HTTP 200 even when a command inside it
+    fails, so each result is checked for an error too.
+    """
+    response = httpx.post(
+        f"{UPSTASH_URL}/pipeline", json=commands, timeout=10,
+        headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"},
+    )
+    response.raise_for_status()
+    results = response.json()
+    for item in results:
+        if isinstance(item, dict) and item.get("error"):
+            raise ValueError(f"Upstash: {item['error']}")
+    return [item.get("result") if isinstance(item, dict) else item for item in results]
+
+
+# Where each part of the state lives in Upstash. Trades are a hash, one field
+# per trade, and results a list, so a running copy of the bot only ever
+# writes what it changed. (The state used to be one blob, and during a deploy
+# Render runs the old and new copies side by side for a minute or two: the
+# last copy to save erased every trade only the other one knew about.)
+TRADES_KEY = f"{STATE_KEY}:trades"
+HISTORY_KEY = f"{STATE_KEY}:history"
+META_KEY = f"{STATE_KEY}:meta"
+
+
+def trade_json(trade: dict) -> str:
+    """A trade as stored remotely: everything but per-poll bookkeeping.
+
+    candle_mark changes on every poll and losing it on a restart is harmless
+    (the next check simply starts from the trade's creation time), so leaving
+    it out means routine polling never costs a remote write.
+    """
+    return json.dumps({k: v for k, v in trade.items() if k != "candle_mark"},
+                      sort_keys=True)
+
+
+def snapshot(data: dict) -> dict:
+    """The durable parts of the state, each serialised, keyed by id."""
+    return {
+        "trades": {t["id"]: trade_json(t) for t in data.get("trades", []) if t.get("id")},
+        "history": {r["id"]: json.dumps(r, sort_keys=True)
+                    for r in data.get("history", []) if r.get("id")},
+        "meta": json.dumps({"chats": data.get("chats", []),
+                            "offers": data.get("offers", {})}, sort_keys=True),
+    }
+
+
+def changes_between(old: dict, new: dict) -> list[list]:
+    """The Upstash commands that turn snapshot `old` into `new`."""
+    commands: list[list] = []
+    for trade_id, value in new["trades"].items():
+        if old["trades"].get(trade_id) != value:
+            commands.append(["HSET", TRADES_KEY, trade_id, value])
+    for trade_id in old["trades"].keys() - new["trades"].keys():
+        commands.append(["HDEL", TRADES_KEY, trade_id])
+    added = [value for rid, value in new["history"].items() if rid not in old["history"]]
+    if added:
+        commands.append(["RPUSH", HISTORY_KEY, *added])
+        commands.append(["LTRIM", HISTORY_KEY, -HISTORY_LIMIT, -1])
+    if new["meta"] != old["meta"]:
+        commands.append(["SET", META_KEY, new["meta"]])
+    return commands
+
+
 class RemoteState:
-    """The durable copy of the state in Upstash, written off the event loop.
+    """The durable copy of the state in Upstash.
 
-    Writes go through one background thread that always sends the newest
-    snapshot, so a slow or failing network never stalls price checks, and a
-    burst of saves collapses into one request.
+    Saves go through one background thread, so a slow or failing network
+    never stalls price checks, and a burst of saves collapses into one
+    pipelined request carrying only what changed since the last one.
 
-    Nothing is written until the copy has been read successfully at startup.
-    Otherwise a network blip during boot would start the bot empty and its
-    first save would overwrite every stored trade with that empty state.
+    Two copies of the bot can run at once — Render starts the new one before
+    stopping the old — so the copies also sync with each other: reconcile()
+    adopts trades another copy added, changed or closed, and claim() lets
+    only one copy send each alert.
+
+    Nothing is written until the stored copy has been read and the token
+    proven able to write. Otherwise a network blip during boot would start the
+    bot empty, and a read-only token would silently drop every save.
     """
 
     def __init__(self) -> None:
         self.enabled = bool(UPSTASH_URL and UPSTASH_TOKEN)
-        self.ready = False  # set once the stored copy has been read
+        self.ready = False
         # Why saving is off despite the keys being set, for the start-up notice
         self.problem: Optional[str] = None
-        self._latest: Optional[str] = None
-        self._sent: Optional[str] = None
-        self._wake = threading.Condition()
+        # What Upstash holds as far as this copy knows: written by us, or read
+        self._synced = {"trades": {}, "history": {}, "meta": None}
+        self._latest: Optional[dict] = None  # newest snapshot not yet sent
+        self._in_flight = False
+        self._lock = threading.Condition()
         if self.enabled:
             threading.Thread(target=self._run, name="remote-state", daemon=True).start()
+
+    # -- start-up ---------------------------------------------------------
 
     def load(self) -> Optional[dict]:
         """The stored state, or None when there is none or it can't be read."""
@@ -222,7 +298,10 @@ class RemoteState:
             return None
         for attempt in range(3):
             try:
-                raw = upstash(["GET", STATE_KEY])
+                trades, history, meta, legacy = upstash_pipeline([
+                    ["HGETALL", TRADES_KEY], ["LRANGE", HISTORY_KEY, 0, -1],
+                    ["GET", META_KEY], ["GET", STATE_KEY],
+                ])
             except (httpx.HTTPError, ValueError) as error:
                 logger.warning("Upstash read failed (attempt %d): %s", attempt + 1, error)
                 time.sleep(2 * (attempt + 1))
@@ -230,22 +309,40 @@ class RemoteState:
             if not self._can_write():
                 return None
             self.ready = True
-            if not raw:
-                logger.info("No saved state in Upstash yet")
-                return None
-            try:
-                data = json.loads(raw)
-            except ValueError:
-                logger.error("Saved state in Upstash is not valid JSON, ignoring it")
-                return None
-            logger.info("Loaded %d trade(s) from Upstash", len(data.get("trades", [])))
-            return data
+            if not (trades or history or meta) and legacy:
+                return self._import_legacy(legacy)
+            data = {
+                **(json.loads(meta) if meta else {}),
+                "trades": [json.loads(v) for v in (trades or [])[1::2]],
+                "history": [json.loads(v) for v in history or []],
+            }
+            self._synced = snapshot(data)
+            logger.info("Loaded %d trade(s) and %d result(s) from Upstash",
+                        len(data["trades"]), len(data["history"]))
+            return data or None
         self.problem = "could not read Upstash, saving to it is OFF this run"
         logger.error(
             "Could not read the saved state from Upstash — NOT writing to it this "
             "run, so the stored trades can't be overwritten with an empty list"
         )
         return None
+
+    def _import_legacy(self, raw: str) -> Optional[dict]:
+        """Move a state saved as one blob (the old layout) into the new keys."""
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            logger.error("Old saved state in Upstash is not valid JSON, ignoring it")
+            return None
+        for trade in data.get("trades", []):
+            trade.setdefault("id", secrets.token_hex(4))
+        for record in data.get("history", []):
+            record.setdefault("id", secrets.token_hex(6))
+        empty = {"trades": {}, "history": {}, "meta": None}
+        upstash_pipeline(changes_between(empty, snapshot(data)) + [["DEL", STATE_KEY]])
+        self._synced = snapshot(data)
+        logger.info("Moved the old saved state into per-trade storage")
+        return data
 
     def _can_write(self) -> bool:
         """Check the token may write, with a throwaway key that expires.
@@ -271,24 +368,30 @@ class RemoteState:
         logger.error(detail)
         return False
 
-    def save(self, payload: str) -> None:
-        """Queue a snapshot to store; only the newest pending one is sent."""
-        if not (self.enabled and self.ready) or payload == self._sent:
+    # -- saving -----------------------------------------------------------
+
+    def save(self, data: dict) -> None:
+        """Queue the current state; only what changed gets sent."""
+        if not (self.enabled and self.ready):
             return
-        with self._wake:
-            self._latest = payload
-            self._wake.notify()
+        snap = snapshot(data)
+        with self._lock:
+            self._latest = snap
+            self._lock.notify()
 
     def _run(self) -> None:
         while True:
-            with self._wake:
+            with self._lock:
                 while self._latest is None:
-                    self._wake.wait()
-                payload, self._latest = self._latest, None
+                    self._lock.wait()
+                snap, self._latest = self._latest, None
+                commands = changes_between(self._synced, snap)
+                self._in_flight = bool(commands)
+            if not commands:
+                continue
             for attempt in range(3):
                 try:
-                    upstash(["SET", STATE_KEY, payload])
-                    self._sent = payload
+                    upstash_pipeline(commands)
                     break
                 except (httpx.HTTPError, ValueError) as error:
                     logger.warning("Upstash write failed (attempt %d): %s",
@@ -296,24 +399,93 @@ class RemoteState:
                     time.sleep(2 * (attempt + 1))
             else:
                 logger.error("Could not save state to Upstash after 3 attempts")
+                with self._lock:
+                    self._in_flight = False
+                continue
+            with self._lock:
+                self._record_sent(commands)
+                self._in_flight = False
+
+    def _record_sent(self, commands: list[list]) -> None:
+        """Update what Upstash is known to hold after `commands` succeeded."""
+        for command in commands:
+            if command[0] == "HSET":
+                self._synced["trades"][command[2]] = command[3]
+            elif command[0] == "HDEL":
+                self._synced["trades"].pop(command[2], None)
+            elif command[0] == "RPUSH":
+                for value in command[2:]:
+                    self._synced["history"][json.loads(value)["id"]] = value
+            elif command[0] == "SET" and command[1] == META_KEY:
+                self._synced["meta"] = command[2]
+
+    # -- keeping two running copies in step -------------------------------
+
+    def reconcile(self, data: dict, trades: list) -> int:
+        """Bring this copy's trades in line with what other copies stored.
+
+        `trades` is Upstash's HGETALL reply. A trade another copy added is
+        adopted; one it changed is updated, unless this copy has unsent
+        changes to it; one it closed is dropped (that copy sent the alert).
+        Returns how many trades changed. Skipped while a save is pending, as
+        local state is then ahead of Upstash.
+        """
+        remote = dict(zip(trades[0::2], trades[1::2])) if trades else {}
+        changed = 0
+        with self._lock:
+            if self._latest is not None or self._in_flight:
+                return 0
+            synced = self._synced["trades"]
+            local = {t["id"]: t for t in data["trades"] if t.get("id")}
+            for trade_id, value in remote.items():
+                mine = local.get(trade_id)
+                if mine is None:
+                    if trade_id not in synced:  # added by another copy
+                        data["trades"].append(json.loads(value))
+                        synced[trade_id] = value
+                        changed += 1
+                elif value != synced.get(trade_id) and trade_json(mine) == synced.get(trade_id):
+                    mark = mine.get("candle_mark")
+                    mine.clear()
+                    mine.update(json.loads(value))
+                    if mark is not None:
+                        mine["candle_mark"] = mark
+                    synced[trade_id] = value
+                    changed += 1
+            for trade_id, mine in local.items():
+                if (trade_id not in remote and trade_id in synced
+                        and trade_json(mine) == synced[trade_id]):
+                    data["trades"].remove(mine)  # closed by another copy
+                    del synced[trade_id]
+                    changed += 1
+        return changed
+
+    def claim(self, name: str) -> bool:
+        """True if this copy should act on a one-off event (send an alert).
+
+        The first copy to claim a name wins it for a day. Without Upstash —
+        or if it can't be reached — every copy acts, as there's only one.
+        """
+        if not self.ready:
+            return True
+        try:
+            return upstash(["SET", f"{STATE_KEY}:claim:{name}", "1", "NX", "EX", "86400"]) == "OK"
+        except (httpx.HTTPError, ValueError) as error:
+            logger.warning("Upstash claim failed, acting anyway: %s", error)
+            return True
+
+    def history(self) -> Optional[list[dict]]:
+        """Every stored result, from all copies — None if unavailable."""
+        if not self.ready:
+            return None
+        try:
+            return [json.loads(v) for v in upstash(["LRANGE", HISTORY_KEY, 0, -1]) or []]
+        except (httpx.HTTPError, ValueError) as error:
+            logger.warning("Could not read results from Upstash: %s", error)
+            return None
 
 
 remote_state = RemoteState()
-
-
-def durable_snapshot(data: dict) -> str:
-    """The state as stored remotely: everything except per-poll bookkeeping.
-
-    candle_mark changes on every poll and losing it on a restart is harmless
-    (the next check simply starts from the trade's creation time), so leaving
-    it out means routine polling never costs a remote write.
-    """
-    trimmed = dict(data)
-    trimmed["trades"] = [
-        {k: v for k, v in trade.items() if k != "candle_mark"}
-        for trade in data.get("trades", [])
-    ]
-    return json.dumps(trimmed, sort_keys=True)
 
 
 def load_state() -> dict:
@@ -327,12 +499,16 @@ def load_state() -> dict:
     data.setdefault("trades", [])
     data.setdefault("history", [])  # closed trades, for /stats
     data.setdefault("offers", {})   # running trades offered for monitoring
+    # Saved remotely by id, so every trade and result needs one
+    for record in data["history"]:
+        record.setdefault("id", secrets.token_hex(6))
     data.pop("last_sent", None)  # retired: the scheduled motivation texts
     # Migrate trades written by older versions, which lacked these fields.
     # Every key monitor_trades reads is defaulted here: a trade missing one
     # used to raise mid-cycle and abort the checks for every other trade too.
     now = utcnow_iso()
     for trade in data["trades"]:
+        trade.setdefault("id", secrets.token_hex(4))
         trade.setdefault("status", "active")
         trade.setdefault("created_at", now)
         # Trades from before providers were recorded were all on Bybit, which
@@ -358,7 +534,7 @@ def save_state() -> None:
         tmp.replace(STATE_FILE)
     except OSError:
         logger.exception("Could not save state to %s", STATE_FILE)
-    remote_state.save(durable_snapshot(state))
+    remote_state.save(state)
 
 
 state = load_state()
@@ -1366,6 +1542,7 @@ def record_result(
             pnl = (move_pct(trade, trade["tp"]) + pnl) / 2
         pnl = round(pnl, 2)
     state["history"].append({
+        "id": secrets.token_hex(6),
         "chat_id": trade["chat_id"],
         "asset": trade["asset"],
         "direction": trade["direction"],
@@ -1529,8 +1706,12 @@ async def tidy_trade(
 
     if trade_expired(trade, now):
         trades.remove(trade)
-        record_result(trade, "expired")
+        claimed = await asyncio.to_thread(remote_state.claim, f"{trade.get('id')}:expired")
+        if claimed:
+            record_result(trade, "expired")
         save_state()
+        if not claimed:
+            return False
         await deliver(
             context, trade["chat_id"],
             f"⌛ Stopped monitoring {trade['asset']} — no result after "
@@ -1547,6 +1728,8 @@ async def tidy_trade(
         if market is None:
             trades.remove(trade)
             save_state()
+            if not await asyncio.to_thread(remote_state.claim, f"{trade.get('id')}:retired"):
+                return False
             reason = (unmonitored_reason(trade["asset"])
                       or "no price feed lists it any more")
             await deliver(
@@ -1566,6 +1749,19 @@ async def tidy_trade(
         save_state()
 
     return True
+
+
+def follow_event(trade: dict, event: str) -> None:
+    """Apply an event's state change without alerting or recording it —
+    another running copy of the bot claimed it and did both."""
+    if event == "entry":
+        trade["status"] = "active"
+    elif event == "breakeven":
+        trade["be_alerted"] = True
+    elif event == "tp1":
+        trade.update(tp1_hit=True, sl=trade["entry"], be_alerted=True, loss_pct=0.0)
+    elif trade in state["trades"]:
+        state["trades"].remove(trade)  # missed, tp, tp2, be or sl: closed
 
 
 async def apply_feed(
@@ -1605,6 +1801,14 @@ async def apply_feed(
             # Now that the side is known, so is LIMIT vs STOP
             trade["order_type"] = order_type_for(
                 trade["direction"], trade["fill_direction"])
+        return
+
+    # Two copies of the bot can be running (Render overlaps them during a
+    # deploy) and both see the same price. Only the copy that claims the
+    # event alerts and records it; the other just follows along quietly.
+    if not await asyncio.to_thread(remote_state.claim, f"{trade.get('id')}:{event}"):
+        follow_event(trade, event)
+        save_state()
         return
 
     if event == "entry":
@@ -1719,6 +1923,26 @@ async def fetch_feeds(
 
 # When each market was last polled (time.monotonic())
 _last_polled: dict[tuple[str, str], float] = {}
+# How often to pick up trades other running copies of the bot changed
+RECONCILE_INTERVAL = 20
+_last_reconcile = float("-inf")
+
+
+async def sync_with_other_copies() -> None:
+    """Every RECONCILE_INTERVAL, adopt what other running copies stored."""
+    global _last_reconcile
+    if not remote_state.ready or time.monotonic() - _last_reconcile < RECONCILE_INTERVAL:
+        return
+    _last_reconcile = time.monotonic()
+    try:
+        stored = await asyncio.to_thread(upstash, ["HGETALL", TRADES_KEY])
+    except (httpx.HTTPError, ValueError) as error:
+        logger.warning("Could not sync trades from Upstash: %s", error)
+        return
+    changed = remote_state.reconcile(state, stored or [])
+    if changed:
+        logger.info("Synced %d trade change(s) from another running copy", changed)
+        save_state()
 
 
 async def monitor_trades(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1729,6 +1953,7 @@ async def monitor_trades(context: ContextTypes.DEFAULT_TYPE) -> None:
     request; with a few slow feeds it overran the interval, and the scheduler
     then skipped whole cycles rather than run two at the same time.
     """
+    await sync_with_other_copies()
     if not state["trades"]:
         return
 
@@ -2337,10 +2562,19 @@ async def list_trades(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 LOCAL_TZ = ZoneInfo(os.environ.get("LOCAL_TIMEZONE", "Africa/Lagos"))
 
 
-def results_since(chat_id: int, since: Optional[datetime]) -> list[dict]:
+async def all_results() -> list[dict]:
+    """Every recorded result: from Upstash when set up, so results recorded
+    by another running copy of the bot count too; else this copy's own."""
+    stored = await asyncio.to_thread(remote_state.history)
+    return stored if stored is not None else state["history"]
+
+
+def results_since(
+    chat_id: int, since: Optional[datetime], records: Optional[list[dict]] = None
+) -> list[dict]:
     """This chat's closed trades, newest last, closed at or after `since`."""
     out = []
-    for record in state["history"]:
+    for record in state["history"] if records is None else records:
         if record["chat_id"] != chat_id:
             continue
         if since is not None:
@@ -2415,25 +2649,30 @@ async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     else:
         await message.reply_text("Use /stats, /stats 7 (days) or /stats all.")
         return
+    records = await all_results()
     await message.reply_text(
-        summarize_results(results_since(message.chat_id, since), title))
+        summarize_results(results_since(message.chat_id, since, records), title))
 
 
 async def weekly_summary(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Sunday evening: the week's results to every chat that closed a trade."""
+    week = datetime.now(LOCAL_TZ).strftime("%G-W%V")
+    if not await asyncio.to_thread(remote_state.claim, f"weekly:{week}"):
+        return  # another running copy is sending it
     since = datetime.now(dt_timezone.utc) - timedelta(days=7)
-    chats = {r["chat_id"] for r in results_since_any(since)}
+    every = await all_results()
+    chats = {r["chat_id"] for r in results_since_any(since, every)}
     for chat_id in chats:
-        records = results_since(chat_id, since)
+        records = results_since(chat_id, since, every)
         if any(r.get("pnl_pct") is not None for r in records):
             await deliver(context, chat_id,
                           summarize_results(records, "This week's results 🗓️"))
 
 
-def results_since_any(since: datetime) -> list[dict]:
+def results_since_any(since: datetime, records: list[dict]) -> list[dict]:
     """Every chat's closed trades since `since`."""
     out = []
-    for record in state["history"]:
+    for record in records:
         try:
             if datetime.fromisoformat(record["closed_at"]) >= since:
                 out.append(record)
