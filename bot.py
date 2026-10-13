@@ -208,6 +208,8 @@ class RemoteState:
     def __init__(self) -> None:
         self.enabled = bool(UPSTASH_URL and UPSTASH_TOKEN)
         self.ready = False  # set once the stored copy has been read
+        # Why saving is off despite the keys being set, for the start-up notice
+        self.problem: Optional[str] = None
         self._latest: Optional[str] = None
         self._sent: Optional[str] = None
         self._wake = threading.Condition()
@@ -225,6 +227,8 @@ class RemoteState:
                 logger.warning("Upstash read failed (attempt %d): %s", attempt + 1, error)
                 time.sleep(2 * (attempt + 1))
                 continue
+            if not self._can_write():
+                return None
             self.ready = True
             if not raw:
                 logger.info("No saved state in Upstash yet")
@@ -236,11 +240,36 @@ class RemoteState:
                 return None
             logger.info("Loaded %d trade(s) from Upstash", len(data.get("trades", [])))
             return data
+        self.problem = "could not read Upstash, saving to it is OFF this run"
         logger.error(
             "Could not read the saved state from Upstash — NOT writing to it this "
             "run, so the stored trades can't be overwritten with an empty list"
         )
         return None
+
+    def _can_write(self) -> bool:
+        """Check the token may write, with a throwaway key that expires.
+
+        Upstash's read-only token answers reads normally, so a bot given it
+        "loaded from Upstash" fine and then had every save refused — trades
+        were lost on the next restart while start-up said all was well.
+        """
+        try:
+            upstash(["SET", f"{STATE_KEY}:write-check", "1", "EX", "60"])
+            return True
+        except httpx.HTTPStatusError as error:
+            if error.response.status_code in (401, 403):
+                self.problem = ("the Upstash token is READ-ONLY, so trades are NOT "
+                                "saved and are lost on restart — use the normal "
+                                "(read-write) token")
+                logger.error("Upstash refused a write: %s", self.problem)
+                return False
+            detail = f"Upstash write check failed: HTTP {error.response.status_code}"
+        except (httpx.HTTPError, ValueError) as error:
+            detail = f"Upstash write check failed: {error}"
+        self.problem = "could not write to Upstash, saving to it is OFF this run"
+        logger.error(detail)
+        return False
 
     def save(self, payload: str) -> None:
         """Queue a snapshot to store; only the newest pending one is sent."""
@@ -2724,9 +2753,10 @@ async def announce_start(context: ContextTypes.DEFAULT_TYPE) -> None:
         await context.bot.send_message(
             chat_id=ADMIN_CHAT_ID,
             text=f"✅ Bot started — monitoring {len(state['trades'])} trade(s)"
-                 + (", trades loaded from Upstash" if remote_state.ready else
-                    "" if not remote_state.enabled else
-                    " ⚠️ could not read Upstash, saving to it is OFF this run"),
+                 + (", saving to Upstash" if remote_state.ready else
+                    " — ⚠️ trades are NOT saved, they'll be lost on restart "
+                    "(Upstash isn't set up)" if not remote_state.enabled else
+                    f" — ⚠️ {remote_state.problem}"),
         )
     except Exception as error:  # noqa: BLE001
         logger.warning("Could not send the start-up notice: %s", error)

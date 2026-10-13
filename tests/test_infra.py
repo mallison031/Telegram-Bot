@@ -22,7 +22,7 @@ def test_durable_snapshot_leaves_out_per_poll_bookkeeping():
 @pytest.fixture
 def remote(monkeypatch):
     """A RemoteState wired to an in-memory fake Upstash."""
-    store, writes, fail = {}, [], {"read": False}
+    store, writes, fail = {}, [], {"read": False, "write": None}
     done = threading.Event()
 
     def fake_upstash(command):
@@ -30,6 +30,12 @@ def remote(monkeypatch):
             if fail["read"]:
                 raise httpx.ConnectError("down")
             return store.get(command[1])
+        if fail["write"]:
+            raise httpx.HTTPStatusError(
+                "refused", request=httpx.Request("POST", "https://fake"),
+                response=httpx.Response(fail["write"]))
+        if command[1].endswith(":write-check"):
+            return "OK"  # the start-up permission probe, not a state save
         store[command[1]] = command[2]
         writes.append(command[2])
         done.set()
@@ -58,6 +64,32 @@ def test_remote_state_never_writes_after_a_failed_read(remote):
     assert rs.load() is None and not rs.ready
     rs.save('{"trades": []}')
     assert not done.wait(0.3) and writes == []
+
+
+def test_read_only_token_is_caught_at_startup(remote):
+    """Regression: Upstash's read-only token reads fine, so the bot reported
+    "loaded from Upstash" while every save was refused and trades were lost
+    on the next restart."""
+    store, writes, fail, done = remote
+    fail["write"] = 403
+    rs = bot.RemoteState()
+    rs.load()
+    assert not rs.ready and "READ-ONLY" in rs.problem
+    rs.save('{"trades": []}')
+    assert not done.wait(0.3) and writes == []
+
+
+def test_start_notice_reports_saving_problems(monkeypatch):
+    monkeypatch.setattr(bot, "ADMIN_CHAT_ID", "42")
+    rs = bot.RemoteState.__new__(bot.RemoteState)
+    rs.enabled, rs.ready, rs.problem = True, False, "the Upstash token is READ-ONLY"
+    monkeypatch.setattr(bot, "remote_state", rs)
+    ctx = FakeContext()
+    asyncio.run(bot.announce_start(ctx))
+    assert "⚠️ the Upstash token is READ-ONLY" in ctx.bot.sent[-1][1]
+    rs.enabled = False
+    asyncio.run(bot.announce_start(ctx))
+    assert "NOT saved" in ctx.bot.sent[-1][1]
 
 
 def test_retry_after_parsing():
@@ -123,3 +155,9 @@ def test_admin_alerts_are_batched_and_deduplicated(monkeypatch):
         assert len(ctx.bot.sent) == 1  # repeat within the quiet period
     finally:
         log.removeHandler(bot.admin_alerts)
+
+
+def test_tests_never_see_the_real_upstash():
+    """conftest must blank the Upstash keys even when .env has the real ones."""
+    assert bot.UPSTASH_URL == "" and bot.UPSTASH_TOKEN == ""
+    assert not bot.remote_state.enabled
