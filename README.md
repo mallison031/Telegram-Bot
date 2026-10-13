@@ -185,6 +185,13 @@ current one automatically.)
   long to wait; the bot waits exactly that long and retries, for up to 75 s,
   so a burst of three charts all get answered (the last in ~45 s) instead of
   the third failing.
+- The model **reasons before answering** (`VISION_REASONING_EFFORT`, default
+  `medium`), and the prompt tells it to read the levels off the box edges —
+  entry is the edge the red and green boxes share, never the current-price
+  line that crosses them. Without both, it called every chart a SHORT and
+  read the current price as the entry (2 of 6 test charts right); with them,
+  every labelled test chart is read exactly. Charts whose position tool shows
+  no price labels can come back a gridline off, so keep the labels visible.
 - The model is forced into **JSON mode** and given the `ChartAnalysis` schema
   (asset, direction, entry, SL, TP, current price, how many position tools it
   saw). The reply is validated against that schema, and a mismatch is retried

@@ -109,6 +109,14 @@ VISION_MODELS = [
     "qwen/qwen3.8-27b",
 ]
 
+# How hard the model thinks before answering: "none", "low", "medium" or
+# "high". Without reasoning (Groq's default) it called every chart a SHORT and
+# read the current-price line as the entry: 2 of 6 test charts right. With
+# "medium" and the prompt's box-edge instructions, every labelled chart is
+# read exactly, for ~2 s more per chart. Reasoning tokens are output, so they
+# don't eat into the free tier's per-minute input-token budget.
+VISION_REASONING_EFFORT = os.environ.get("VISION_REASONING_EFFORT", "medium")
+
 # When every model is busy the whole list is retried after a pause: as long
 # as Groq's 429 says the per-minute budget needs to free up, or else these
 # successive waits (the last repeats). Waiting beats failing the user's chart.
@@ -293,13 +301,23 @@ there is only one), and return the levels of the right-most one only.
 How to read the chart:
 - The asset name is usually in the top-left corner (e.g. "Bitcoin / U.S. Dollar" \
 means the asset symbol is BTCUSD). Return the compact ticker symbol.
-- The position tool draws two shaded boxes. The RED shaded box is the Stop Loss \
-zone. The GREEN or BLUE shaded box is the Take Profit zone. The horizontal line \
-separating them is the Entry price.
+- The position tool draws two shaded boxes stacked on top of each other: a \
+RED box (the Stop Loss zone) and a GREEN or BLUE box (the Take Profit zone). \
+Read the three levels from the boxes' edges:
+  - entry = the edge the red and green boxes SHARE, where one ends and the \
+other begins;
+  - stop_loss = the far edge of the red box (the edge away from the green box);
+  - take_profit = the far edge of the green/blue box (the edge away from the \
+red box).
+- Do NOT confuse the entry with the current-price line. The current price is a \
+separate horizontal line that runs across the whole chart to the highlighted \
+label on the right price axis, and it often crosses straight through one of \
+the boxes. It is never the entry unless it happens to sit exactly on the edge \
+the two boxes share.
 - Read exact price values from the labels on the position tool or the price \
 axis on the right.
-- direction: "SHORT" if the red (stop loss) box is ABOVE the entry line, \
-"LONG" if the red box is BELOW the entry line.
+- direction: "SHORT" if the red (stop loss) box is ABOVE the green box, \
+"LONG" if the red box is BELOW the green box.
 - current_price is the price the market is currently trading at: the \
 highlighted/coloured label on the right price axis, level with the last candle \
 on the right edge. If you genuinely cannot see it, set it to null rather than \
@@ -374,6 +392,7 @@ def request_chart_analysis(
             "response_format": {"type": "json_object"},
             # Groq rejects JSON mode unless reasoning is hidden or parsed out
             "reasoning_format": "hidden",
+            "reasoning_effort": VISION_REASONING_EFFORT,
             "temperature": 0,
         },
     )
