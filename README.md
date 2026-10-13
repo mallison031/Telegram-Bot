@@ -157,14 +157,14 @@ All feeds are public, keyless and free:
   no wick is missed. It lists spot pairs only, so coins that trade solely as
   perpetuals on derivatives exchanges aren't covered.
 - Charts no provider carries still get a signal; they just don't get
-  breakeven/TP/SL alerts, and the bot says why.
+  breakeven/TP/SL alerts (the reason goes to the log, not the chat).
 
 > **Why indices and oil aren't monitored.** No free feed tracks index or oil
 > CFD prices in real time. Yahoo's cash indices (`^DJI`, `^IXIC`…) only move
 > during NYSE hours — frozen for ~70% of the day while `US30` trades on — and
 > sit hundreds of points off the CFD price; its futures (`YM=F`, `CL=F`) are
 > ~10 minutes delayed. Watching them produced silence or wrong alerts, so the
-> bot now says up front that these charts get no alerts. A free OANDA practice
+> bot sends their signal but doesn't monitor them. A free OANDA practice
 > account would provide real-time index and oil CFD prices if this is needed.
 
 (The previous metals feed, `gold-api.com`, refreshed only every 30 s and sat
@@ -433,8 +433,8 @@ add:
 5. **Is it gold, silver or forex?** Swissquote publishes quotes, not candles,
    so a wick that reverses between 5 s polls can be missed. Crypto is checked
    on 1-minute high/low and cannot miss one.
-6. **Is it an index or oil?** These aren't monitored at all — the bot says so
-   when you send the chart.
+6. **Is it an index or oil?** These get the signal but are never monitored,
+   and aren't listed in `/trades`. The log says `Not monitoring <asset>`.
 7. **Check the logs.** Every event logs its sample, e.g.
    `XAUUSD SHORT -> SL (last 4310.93, range 4309.82-4310.93 since 09:41:00)`. A trade
    that keeps failing logs `Monitoring failed for <asset> in chat <id>` with a
@@ -450,9 +450,11 @@ position tool. If two start at nearly the same point the model can pick the
 other one — crop the screenshot to the setup you mean. When it sees more than
 one tool it tells you how many it found.
 
-**A trade says monitoring is unavailable.** Either it's an index or oil (not
-monitored, see *Which assets can be monitored*), or no feed lists that symbol —
-make sure the chart shows a standard ticker (e.g. `XAUUSD`, `EURUSD`, `BTCUSD`).
+**A signal arrived but the trade isn't in `/trades`.** It isn't being
+monitored: either it's an index or oil (see *Which assets can be monitored*),
+or no feed lists that symbol — make sure the chart shows a standard ticker
+(e.g. `XAUUSD`, `EURUSD`, `BTCUSD`). The log line `Not monitoring <asset>`
+says which.
 
 ### Updating the bot
 

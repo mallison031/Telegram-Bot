@@ -1732,10 +1732,11 @@ async def handle_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await message.reply_text(context_note)
 
         if not market:
-            reason = unmonitored_reason(data.asset) or "no price feed lists it"
-            await message.reply_text(
-                f"ℹ️ Live monitoring isn't available for {data.asset.upper()} "
-                f"— {reason}. Breakeven/TP/SL alerts are off for this trade."
+            # The signal alone is the reply: the chat doesn't want a notice
+            # that alerts are off, so it only goes to the log.
+            logger.info(
+                "Not monitoring %s: %s", data.asset.upper(),
+                unmonitored_reason(data.asset) or "no price feed lists it",
             )
             return
 
