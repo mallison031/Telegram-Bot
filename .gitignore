@@ -7,3 +7,6 @@ __pycache__/
 # Runtime state: chat IDs and open trades — never commit
 state.json
 bot.log
+
+# Test caches
+.pytest_cache/

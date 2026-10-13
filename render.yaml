@@ -3,10 +3,8 @@ services:
     name: signal-bot
     runtime: python
     # Free instances get no persistent disk, so state.json is wiped on every
-    # redeploy and restart and monitored trades are forgotten — re-send the
-    # chart to re-register. To persist them, switch to `plan: starter` and add:
-    #   disk: {name: bot-state, mountPath: /var/data, sizeGB: 1}
-    #   envVars: STATE_FILE=/var/data/state.json
+    # redeploy and restart. Set the UPSTASH_* variables below (free Redis) and
+    # monitored trades and results are kept there instead.
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
@@ -14,4 +12,14 @@ services:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: GROQ_API_KEY
+        sync: false
+      # Optional: trades survive restarts (Upstash), backup chart reader
+      # (Gemini), error alerts to you (your Telegram user id)
+      - key: UPSTASH_REDIS_REST_URL
+        sync: false
+      - key: UPSTASH_REDIS_REST_TOKEN
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: ADMIN_CHAT_ID
         sync: false

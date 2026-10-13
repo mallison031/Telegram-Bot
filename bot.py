@@ -24,22 +24,26 @@ few seconds on the broker's own bid/ask.
 
 import asyncio
 import base64
+import collections
 import json
 import logging
 import os
 import random
 import re
 import secrets
+import threading
 import time
 from datetime import datetime, timedelta
+from datetime import time as dt_time
 from datetime import timezone as dt_timezone
 from pathlib import Path
 from typing import Literal, NamedTuple, Optional
+from zoneinfo import ZoneInfo
 
 import httpx
 from dotenv import load_dotenv
 from pydantic import BaseModel
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
@@ -54,9 +58,17 @@ load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
+# Optional backup chart reader for when Groq's per-minute budget is spent
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 # Optional settings
 STATE_FILE = Path(os.environ.get("STATE_FILE", "state.json"))
+# Optional durable copy of the state in Upstash Redis (free tier). Render's
+# free instances have no disk, so without this every deploy or restart
+# forgets every monitored trade. Leave unset to keep state in STATE_FILE only.
+UPSTASH_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "").rstrip("/")
+UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
+STATE_KEY = os.environ.get("STATE_KEY", "signal-bot:state")
 
 
 # Fraction of the entry->TP distance that triggers the breakeven alert
@@ -99,15 +111,23 @@ COINBASE_PRODUCTS_URL = "https://api.exchange.coinbase.com/products"
 # console.groq.com and create a key.
 GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
 
-# Tried in order — first one that responds wins. Groq currently serves a
-# single vision model; the list stays so another can be added as a fallback.
-# Free-tier limits for it: 30 requests/min, 1,000/day and 7,000 input
-# tokens/min. A chart costs ~3,500 tokens (the image alone is 2,048), so
-# about two charts a minute fit before Groq answers 429; extract_chart_analysis
-# then waits as long as Groq says and tries again.
-VISION_MODELS = [
-    "qwen/qwen3.8-27b",
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+
+# (provider, model), tried in order — first one that responds wins.
+# Groq's free tier allows 30 requests/min, 1,000/day and 7,000 input
+# tokens/min; a chart costs ~3,500 tokens (the image alone is 2,048), so
+# about two charts a minute fit before it answers 429. With GEMINI_API_KEY
+# set, a chart that finds Groq full goes straight to Gemini's free tier
+# instead of waiting; without it, extract_chart_analysis waits as long as
+# Groq says and tries again.
+GEMINI_MODELS = [
+    m.strip() for m in os.environ.get(
+        "GEMINI_MODELS", "gemini-3.6-flash,gemini-3.1-flash-lite,gemini-flash-latest"
+    ).split(",") if m.strip()
 ]
+VISION_MODELS = [("groq", "qwen/qwen3.8-27b")] + (
+    [("gemini", model) for model in GEMINI_MODELS] if GEMINI_API_KEY else []
+)
 
 # How hard the model thinks before answering: "none", "low", "medium" or
 # "high". Without reasoning (Groq's default) it called every chart a SHORT and
@@ -163,15 +183,121 @@ def utcnow_iso() -> str:
     return datetime.now(dt_timezone.utc).isoformat()
 
 
+def upstash(command: list) -> object:
+    """Run one Redis command over Upstash's REST API; its result, or raises."""
+    response = httpx.post(
+        UPSTASH_URL, json=command, timeout=10,
+        headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"},
+    )
+    response.raise_for_status()
+    return response.json().get("result")
+
+
+class RemoteState:
+    """The durable copy of the state in Upstash, written off the event loop.
+
+    Writes go through one background thread that always sends the newest
+    snapshot, so a slow or failing network never stalls price checks, and a
+    burst of saves collapses into one request.
+
+    Nothing is written until the copy has been read successfully at startup.
+    Otherwise a network blip during boot would start the bot empty and its
+    first save would overwrite every stored trade with that empty state.
+    """
+
+    def __init__(self) -> None:
+        self.enabled = bool(UPSTASH_URL and UPSTASH_TOKEN)
+        self.ready = False  # set once the stored copy has been read
+        self._latest: Optional[str] = None
+        self._sent: Optional[str] = None
+        self._wake = threading.Condition()
+        if self.enabled:
+            threading.Thread(target=self._run, name="remote-state", daemon=True).start()
+
+    def load(self) -> Optional[dict]:
+        """The stored state, or None when there is none or it can't be read."""
+        if not self.enabled:
+            return None
+        for attempt in range(3):
+            try:
+                raw = upstash(["GET", STATE_KEY])
+            except (httpx.HTTPError, ValueError) as error:
+                logger.warning("Upstash read failed (attempt %d): %s", attempt + 1, error)
+                time.sleep(2 * (attempt + 1))
+                continue
+            self.ready = True
+            if not raw:
+                logger.info("No saved state in Upstash yet")
+                return None
+            try:
+                data = json.loads(raw)
+            except ValueError:
+                logger.error("Saved state in Upstash is not valid JSON, ignoring it")
+                return None
+            logger.info("Loaded %d trade(s) from Upstash", len(data.get("trades", [])))
+            return data
+        logger.error(
+            "Could not read the saved state from Upstash — NOT writing to it this "
+            "run, so the stored trades can't be overwritten with an empty list"
+        )
+        return None
+
+    def save(self, payload: str) -> None:
+        """Queue a snapshot to store; only the newest pending one is sent."""
+        if not (self.enabled and self.ready) or payload == self._sent:
+            return
+        with self._wake:
+            self._latest = payload
+            self._wake.notify()
+
+    def _run(self) -> None:
+        while True:
+            with self._wake:
+                while self._latest is None:
+                    self._wake.wait()
+                payload, self._latest = self._latest, None
+            for attempt in range(3):
+                try:
+                    upstash(["SET", STATE_KEY, payload])
+                    self._sent = payload
+                    break
+                except (httpx.HTTPError, ValueError) as error:
+                    logger.warning("Upstash write failed (attempt %d): %s",
+                                   attempt + 1, error)
+                    time.sleep(2 * (attempt + 1))
+            else:
+                logger.error("Could not save state to Upstash after 3 attempts")
+
+
+remote_state = RemoteState()
+
+
+def durable_snapshot(data: dict) -> str:
+    """The state as stored remotely: everything except per-poll bookkeeping.
+
+    candle_mark changes on every poll and losing it on a restart is harmless
+    (the next check simply starts from the trade's creation time), so leaving
+    it out means routine polling never costs a remote write.
+    """
+    trimmed = dict(data)
+    trimmed["trades"] = [
+        {k: v for k, v in trade.items() if k != "candle_mark"}
+        for trade in data.get("trades", [])
+    ]
+    return json.dumps(trimmed, sort_keys=True)
+
+
 def load_state() -> dict:
-    data: dict = {}
-    if STATE_FILE.exists():
+    data: dict = remote_state.load() or {}
+    if not data and STATE_FILE.exists():
         try:
             data = json.loads(STATE_FILE.read_text())
         except (json.JSONDecodeError, OSError):
             logger.warning("Could not read %s, starting fresh", STATE_FILE)
     data.setdefault("chats", [])
     data.setdefault("trades", [])
+    data.setdefault("history", [])  # closed trades, for /stats
+    data.setdefault("offers", {})   # running trades offered for monitoring
     data.pop("last_sent", None)  # retired: the scheduled motivation texts
     # Migrate trades written by older versions, which lacked these fields.
     # Every key monitor_trades reads is defaulted here: a trade missing one
@@ -203,6 +329,7 @@ def save_state() -> None:
         tmp.replace(STATE_FILE)
     except OSError:
         logger.exception("Could not save state to %s", STATE_FILE)
+    remote_state.save(durable_snapshot(state))
 
 
 state = load_state()
@@ -369,6 +496,62 @@ def retry_after_seconds(response: httpx.Response, message: str) -> Optional[floa
     return float(match.group(1)) / (1000 if match.group(2) == "ms" else 1)
 
 
+def api_error(response: httpx.Response) -> VisionAPIError:
+    """A VisionAPIError for a non-200 reply, retryable when it's transient."""
+    try:
+        detail = response.json().get("error") or {}
+    except (ValueError, AttributeError):
+        detail = {}
+    message = detail.get("message") or response.text[:200]
+    # Groq's json_validate_failed is a 400, but it means the model produced
+    # malformed JSON this time — a fresh attempt usually succeeds.
+    retryable = (response.status_code in VISION_RETRY_CODES
+                 or detail.get("code") == "json_validate_failed")
+    return VisionAPIError(
+        f"HTTP {response.status_code}: {message}", retryable,
+        retry_after=retry_after_seconds(response, message),
+    )
+
+
+def parse_analysis(content: str) -> ChartAnalysis:
+    """Validate a model's JSON reply; a mismatch is worth another attempt."""
+    try:
+        return ChartAnalysis.model_validate_json(content)
+    except ValueError as error:  # pydantic's ValidationError is a ValueError
+        raise VisionAPIError(f"Unusable reply: {error}", retryable=True) from error
+
+
+def request_gemini_analysis(
+    http: httpx.Client, model: str, image_bytes: bytes, mime_type: str
+) -> ChartAnalysis:
+    """One vision request to Gemini; raises VisionAPIError on any failure."""
+    response = http.post(
+        GEMINI_URL.format(model=model),
+        headers={"x-goog-api-key": GEMINI_API_KEY},
+        json={
+            "contents": [{"parts": [
+                {"inline_data": {
+                    "mime_type": mime_type,
+                    "data": base64.b64encode(image_bytes).decode("ascii"),
+                }},
+                {"text": VISION_PROMPT},
+            ]}],
+            "generationConfig": {
+                "responseMimeType": "application/json",
+                "temperature": 0,
+            },
+        },
+    )
+    if response.status_code != 200:
+        raise api_error(response)
+    try:
+        content = response.json()["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError, TypeError, ValueError) as error:
+        # No candidate usually means the reply was blocked or cut off
+        raise VisionAPIError(f"Unusable reply: {error}", retryable=True) from error
+    return parse_analysis(content)
+
+
 def request_chart_analysis(
     http: httpx.Client, model: str, image_url: str
 ) -> ChartAnalysis:
@@ -398,64 +581,64 @@ def request_chart_analysis(
     )
 
     if response.status_code != 200:
-        try:
-            detail = response.json().get("error") or {}
-        except ValueError:
-            detail = {}
-        message = detail.get("message") or response.text[:200]
-        # json_validate_failed is a 400, but it means the model produced
-        # malformed JSON this time — a fresh attempt usually succeeds.
-        retryable = (response.status_code in VISION_RETRY_CODES
-                     or detail.get("code") == "json_validate_failed")
-        raise VisionAPIError(
-            f"HTTP {response.status_code}: {message}", retryable,
-            retry_after=retry_after_seconds(response, message),
-        )
-
+        raise api_error(response)
     try:
         content = response.json()["choices"][0]["message"]["content"]
-        return ChartAnalysis.model_validate_json(content)
     except (KeyError, IndexError, TypeError, ValueError) as error:
-        # pydantic's ValidationError is a ValueError
         raise VisionAPIError(f"Unusable reply: {error}", retryable=True) from error
+    return parse_analysis(content)
 
 
 def extract_chart_analysis(image_bytes: bytes, mime_type: str) -> ChartAnalysis:
-    """Read a chart with a Groq vision model, as validated JSON (sync).
+    """Read a chart with the first vision model that answers (sync).
 
-    Tries each model in VISION_MODELS until one responds — the free tier
-    returns 429 once the per-minute token budget is spent.
+    Tries every (provider, model) in VISION_MODELS in turn, so a chart that
+    finds Groq's per-minute budget spent goes straight to the backup. When
+    all are busy it waits — as long as the APIs asked — and goes round again,
+    up to VISION_MAX_WAIT. A model failing permanently (a bad key, say) is
+    dropped for this chart rather than failing it while another can answer.
     """
     image_url = (
         f"data:{mime_type};base64,{base64.b64encode(image_bytes).decode('ascii')}"
     )
     deadline = time.monotonic() + VISION_MAX_WAIT
+    models = list(VISION_MODELS)
+    last_error: Exception | None = None
 
     with httpx.Client(timeout=30) as http:
         for attempt in range(1, 100):
-            last_error: Exception | None = None
-            for model in VISION_MODELS:
+            waits: list[float] = []
+            for provider, model in list(models):
                 try:
-                    analysis = request_chart_analysis(http, model, image_url)
+                    if provider == "gemini":
+                        analysis = request_gemini_analysis(
+                            http, model, image_bytes, mime_type)
+                    else:
+                        analysis = request_chart_analysis(http, model, image_url)
                 except Exception as error:  # noqa: BLE001 - try the next model
                     last_error = error
                     if not is_retryable(error):
                         # A bad key or malformed request won't fix itself
-                        logger.error("Model %s failed permanently: %s", model, error)
-                        raise
-                    logger.warning("Model %s busy (attempt %d): %s",
-                                   model, attempt, error)
+                        logger.error("%s %s failed permanently: %s",
+                                     provider, model, error)
+                        models.remove((provider, model))
+                        continue
+                    logger.warning("%s %s busy (attempt %d): %s",
+                                   provider, model, attempt, error)
+                    if getattr(error, "retry_after", None):
+                        waits.append(error.retry_after)
                     continue
 
-                if attempt > 1:
-                    logger.info("Model %s answered on attempt %d", model, attempt)
+                if attempt > 1 or (provider, model) != VISION_MODELS[0]:
+                    logger.info("Chart read by %s %s (attempt %d)",
+                                provider, model, attempt)
                 return analysis
 
-            # Every model is busy. Wait as long as the API asked — the free
-            # tier's per-minute token budget frees up on a schedule it states
-            # — padded a little, or else back off.
-            asked = getattr(last_error, "retry_after", None)
-            wait = (asked + 0.5 if asked
+            if not models:
+                break  # every model failed permanently
+            # Every model is busy. Wait until the soonest one said it would
+            # have room — padded a little — or else back off.
+            wait = (min(waits) + 0.5 if waits
                     else VISION_BACKOFF[min(attempt, len(VISION_BACKOFF)) - 1])
             if time.monotonic() + wait >= deadline:
                 break
@@ -612,7 +795,7 @@ def build_signal_message(data: TradeData, live_price: Optional[float] = None) ->
 
 
 def describe_chart_context(
-    analysis: ChartAnalysis, data: TradeData, decimals: int
+    analysis: ChartAnalysis, data: TradeData, decimals: int, offered: bool = False
 ) -> Optional[str]:
     """What else was on the chart besides the setup being signalled.
 
@@ -644,9 +827,11 @@ def describe_chart_context(
         lines.append(
             f"⚡ A {running.direction} on that chart is already running"
             + (f" — {levels}" if levels else "")
-            + ".\nThat one is not monitored: the signal above is for the most "
-            "recent setup. Send the running trade as its own chart if you want "
-            "breakeven and TP/SL alerts for it too."
+            + ".\nThe signal above is for the most recent setup, so this one "
+            "isn't monitored — "
+            + ("tap below to watch it too." if offered else
+               "send it as its own chart if you want breakeven and TP/SL "
+               "alerts for it too.")
         )
 
     return "\n\n".join(lines) if lines else None
@@ -1124,6 +1309,48 @@ async def fetch_feed(
     return None
 
 
+# Closed trades kept for /stats: the newest HISTORY_LIMIT of them
+HISTORY_LIMIT = 2000
+
+
+def move_pct(trade: dict, price: float) -> float:
+    """Price move from entry to `price`, in % and in the trade's favour."""
+    sign = 1 if trade["direction"] == "LONG" else -1
+    return (price - trade["entry"]) / trade["entry"] * 100 * sign
+
+
+def record_result(
+    trade: dict, result: str, exit_price: Optional[float] = None
+) -> Optional[float]:
+    """Log a finished trade for /stats; returns its % result, if it had one.
+
+    A trade with a TP2 is taken as half closed at TP1 — what the TP1 alert
+    tells the user to do — so its result averages the TP1 move with wherever
+    the other half closed. Trades that never opened (missed, expired while
+    pending, cancelled) are logged without a result and don't count towards
+    the win rate.
+    """
+    pnl = None
+    if exit_price is not None:
+        pnl = move_pct(trade, exit_price)
+        if trade.get("tp1_hit"):
+            pnl = (move_pct(trade, trade["tp"]) + pnl) / 2
+        pnl = round(pnl, 2)
+    state["history"].append({
+        "chat_id": trade["chat_id"],
+        "asset": trade["asset"],
+        "direction": trade["direction"],
+        "order_type": trade.get("order_type"),
+        "entry": trade["entry"],
+        "result": result,
+        "pnl_pct": pnl,
+        "opened_at": trade.get("created_at"),
+        "closed_at": utcnow_iso(),
+    })
+    del state["history"][:-HISTORY_LIMIT]
+    return pnl
+
+
 def check_trade(trade: dict, sample: PriceSample) -> Optional[str]:
     """Return the event for this trade over this interval, or None.
 
@@ -1166,9 +1393,14 @@ def check_trade(trade: dict, sample: PriceSample) -> Optional[str]:
     # tell which came first, and assuming the loss is the honest default —
     # reporting a win the trade may not have taken is the worse error.
     if (adverse <= trade["sl"]) if long else (adverse >= trade["sl"]):
-        return "sl"
+        # A stop sitting on the entry (moved there by hand, or after TP1)
+        # closes the trade flat rather than at a loss
+        return "be" if abs(trade["sl"] - trade["entry"]) <= trade["entry"] * 1e-9 else "sl"
+    # With a TP2, the first target is TP1 and the trade runs on to TP2
+    if trade.get("tp1_hit"):
+        return "tp2" if reached(trade["tp2"], favourable) else None
     if reached_tp:
-        return "tp"
+        return "tp1" if trade.get("tp2") else "tp"
     if not trade.get("be_alerted") and reached(trade["be_price"], favourable):
         return "breakeven"
     return None
@@ -1206,12 +1438,28 @@ SL_MESSAGES = [
     "market will still be here tomorrow — and so will your account. 🌅",
 ]
 
-async def deliver(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str) -> None:
+async def deliver(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, **kwargs
+) -> Optional[Message]:
     """Push a message to a chat; a delivery failure must not abort the job."""
     try:
-        await context.bot.send_message(chat_id=chat_id, text=text)
+        return await context.bot.send_message(chat_id=chat_id, text=text, **kwargs)
     except Exception:
         logger.exception("Could not deliver message to chat %s", chat_id)
+        return None
+
+
+# How many of a trade's messages to remember for reply-to-edit
+TRADE_MESSAGE_LIMIT = 12
+
+
+def remember_message(trade: dict, sent: Optional[Message]) -> None:
+    """Note a message about this trade, so a reply to it can edit the trade."""
+    if sent is None:
+        return
+    ids = trade.setdefault("msg_ids", [])
+    ids.append(sent.message_id)
+    del ids[:-TRADE_MESSAGE_LIMIT]
 
 
 def trade_window_start(trade: dict) -> Optional[datetime]:
@@ -1242,6 +1490,7 @@ async def tidy_trade(
 
     if trade_expired(trade, now):
         trades.remove(trade)
+        record_result(trade, "expired")
         save_state()
         await deliver(
             context, trade["chat_id"],
@@ -1328,6 +1577,7 @@ async def apply_feed(
         ).replace("  ", " ")
     elif event == "missed":
         trades.remove(trade)
+        record_result(trade, "missed")
         text = (
             f"🚪 {trade['asset']}: price reached TP "
             f"({trade['tp']:.{decimals}f}) without coming back to your "
@@ -1343,16 +1593,45 @@ async def apply_feed(
             f"Move your STOP LOSS to BREAKEVEN ({trade['entry']:.{decimals}f}) "
             "to make this a risk-free trade."
         )
-    elif event == "tp":
+    elif event == "tp1":
+        # Half off at TP1 and the stop to entry, so the rest runs risk-free
+        trade["tp1_hit"] = True
+        trade["sl"] = trade["entry"]
+        trade["be_alerted"] = True
+        trade["loss_pct"] = 0.0
+        text = (
+            f"🎯 TP1 hit on {trade['asset']} (+{trade['profit_pct']}%)! "
+            "Close half and move your STOP LOSS to BREAKEVEN "
+            f"({trade['entry']:.{decimals}f}).\n"
+            f"Now watching for TP2 at {trade['tp2']:.{decimals}f} — the stop "
+            "is treated as the entry from here."
+        )
+    elif event in ("tp", "tp2"):
         trades.remove(trade)
-        text = random.choice(TP_MESSAGES).format(
-            asset=trade["asset"], profit=trade["profit_pct"]
+        exit_price = trade["tp2"] if event == "tp2" else trade["tp"]
+        pnl = record_result(trade, event, exit_price)
+        text = random.choice(TP_MESSAGES).format(asset=trade["asset"], profit=pnl)
+        if event == "tp2":
+            text = "🎯🎯 TP2 reached! " + text
+    elif event == "be":
+        trades.remove(trade)
+        pnl = record_result(trade, "be", trade["sl"])
+        text = (
+            f"🔒 {trade['asset']} closed at breakeven "
+            f"({trade['entry']:.{decimals}f}) — no loss taken."
+            + (f" TP1 was already banked on half: +{pnl}% overall."
+               if trade.get("tp1_hit") else "")
         )
     else:  # sl
         trades.remove(trade)
-        text = random.choice(SL_MESSAGES).format(
-            asset=trade["asset"], loss=trade["loss_pct"]
-        )
+        pnl = record_result(trade, "sl", trade["sl"])
+        if pnl > 0:
+            # A stop the user trailed past the entry closes in profit
+            text = (f"🔒 {trade['asset']} stopped out in profit at "
+                    f"{trade['sl']:.{decimals}f} (+{pnl}%).")
+        else:
+            text = random.choice(SL_MESSAGES).format(
+                asset=trade["asset"], loss=abs(pnl))
 
     logger.info(
         "%s %s -> %s (last %s, range %s-%s since %s)",
@@ -1362,7 +1641,10 @@ async def apply_feed(
     )
     # Saved before sending, so a crash between the two can't repeat the alert
     save_state()
-    await deliver(context, trade["chat_id"], text)
+    sent = await deliver(context, trade["chat_id"], text)
+    if trade in trades:
+        remember_message(trade, sent)
+        save_state()
 
 
 async def fetch_feeds(
@@ -1489,8 +1771,9 @@ def chat_trades(chat_id: int) -> list[dict]:
     return [t for t in state["trades"] if t["chat_id"] == chat_id]
 
 
-def describe_trade(trade: dict, index: int) -> str:
-    """One scannable line per trade — the glyph carries the status.
+def describe_trade(trade: dict, index: int, price: Optional[float] = None) -> str:
+    """One scannable entry per trade — the glyph carries the status — plus,
+    given the live price, where the trade stands now.
 
     ⏳ waiting for entry · 🔴 running · 🔒 running, SL already moved to breakeven
     """
@@ -1500,12 +1783,272 @@ def describe_trade(trade: dict, index: int) -> str:
     else:
         glyph = "🔒" if trade.get("be_alerted") else "🔴"
     order = trade.get("order_type") or trade["direction"]
-    return (
+    tp_label = "TP1" if trade.get("tp2") else "TP"
+    line = (
         f"{index}. {glyph} {trade['asset']} {order} · "
         f"E {trade['entry']:.{decimals}f} · "
         f"SL {trade['sl']:.{decimals}f} · "
-        f"TP {trade['tp']:.{decimals}f}"
+        f"{tp_label} {trade['tp']:.{decimals}f}"
+        + (" ✓" if trade.get("tp1_hit") else "")
+        + (f" · TP2 {trade['tp2']:.{decimals}f}" if trade.get("tp2") else "")
     )
+    return line + (f"\n    {live_progress(trade, price)}" if price else "")
+
+
+def live_progress(trade: dict, price: float) -> str:
+    """Where a trade stands at `price`: the move from entry and how far it is
+    along the way to its target, or back towards its stop."""
+    decimals = trade.get("decimals", 2)
+    now = f"now {price:.{decimals}f}"
+    if trade.get("status") == "pending":
+        away = abs(price - trade["entry"]) / trade["entry"] * 100
+        return f"{now} · entry {away:.2f}% away"
+
+    move = move_pct(trade, price)
+    target = trade["tp2"] if trade.get("tp1_hit") else trade["tp"]
+    label = "TP2" if trade.get("tp1_hit") else ("TP1" if trade.get("tp2") else "TP")
+    to_target = move_pct(trade, target)
+    to_stop = -move_pct(trade, trade["sl"])
+    if move >= 0 and to_target > 0:
+        where = f"📈 {min(move / to_target, 1) * 100:.0f}% of the way to {label}"
+    elif move < 0 and to_stop > 0:
+        where = f"📉 {min(-move / to_stop, 1) * 100:.0f}% of the way to SL"
+    else:
+        where = "at entry" if move == 0 else "past the stop (SL at entry)"
+    return f"{now} · {move:+.2f}% · {where}"
+
+
+async def current_prices(trades: list[dict]) -> dict[tuple[str, str], float]:
+    """Live price for each market these trades are on, fetched in parallel."""
+    markets = {(t.get("provider"), t.get("symbol")) for t in trades}
+
+    async def one(http: httpx.AsyncClient, provider: str, symbol: str):
+        try:
+            return await asyncio.wait_for(
+                fetch_market_price(http, {"provider": provider, "symbol": symbol}),
+                FEED_TIMEOUT)
+        except Exception:  # noqa: BLE001 - a missing price just isn't shown
+            return None
+
+    async with httpx.AsyncClient(timeout=FEED_TIMEOUT) as http:
+        prices = await asyncio.gather(*(one(http, p, s) for p, s in markets))
+    return {m: p for m, p in zip(markets, prices) if p}
+
+
+# ---------------------------------------------------------------------------
+# News warnings: ForexFactory's public weekly calendar (keyless)
+# ---------------------------------------------------------------------------
+
+NEWS_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+NEWS_CACHE_SECONDS = 3600
+NEWS_WINDOW_HOURS = 4
+_news_cache: tuple[float, list[dict]] = (float("-inf"), [])
+
+# Index and oil symbols, by the currency whose news moves them
+INDEX_CURRENCIES = {
+    "USD": {"US30", "DJ30", "DJI", "DOW", "WS30", "US500", "SPX500", "SPX", "SP500",
+            "US100", "NAS100", "USTEC", "NASDAQ", "NDX", "USOIL", "WTI", "XTIUSD",
+            "UKOIL", "BRENT", "XBRUSD", "NGAS", "XNGUSD"},
+    "EUR": {"GER40", "GER30", "DE40", "DE30", "DAX", "FRA40", "EU50", "STOXX50"},
+    "GBP": {"UK100", "FTSE"},
+    "JPY": {"JP225", "JPN225", "NIKKEI"},
+    "AUD": {"AUS200"},
+}
+FIAT = {"USD", "EUR", "GBP", "JPY", "CHF", "AUD", "NZD", "CAD", "CNY"}
+
+
+def news_currencies(asset: str) -> set[str]:
+    """Currencies whose high-impact news moves this asset.
+
+    A forex pair is moved by both of its currencies; metals, crypto and US
+    indices by the dollar; other indices by their home currency.
+    """
+    compact = canonical_asset(asset)
+    for currency, symbols in INDEX_CURRENCIES.items():
+        if compact in symbols:
+            return {currency}
+    if len(compact) == 6 and compact[:3] in FIAT and compact[3:] in FIAT:
+        return {compact[:3], compact[3:]}
+    for quote in ("USDT", "USDC", "USD"):
+        if compact.endswith(quote):
+            return {"USD"}  # metals and crypto priced in dollars
+    for quote in FIAT:
+        if compact.endswith(quote):
+            return {quote}
+    return set()
+
+
+async def high_impact_events() -> list[dict]:
+    """This week's high-impact events, each with a parsed "when"; cached."""
+    global _news_cache
+    fetched_at, events = _news_cache
+    if time.monotonic() - fetched_at < NEWS_CACHE_SECONDS:
+        return events
+    try:
+        async with httpx.AsyncClient(timeout=8) as http:
+            response = await http.get(NEWS_URL, headers={"User-Agent": "Mozilla/5.0"})
+            response.raise_for_status()
+            raw = response.json()
+    except (httpx.HTTPError, ValueError) as error:
+        logger.warning("Could not fetch the news calendar: %s", error)
+        return events  # keep serving the last good copy
+    events = []
+    for event in raw if isinstance(raw, list) else []:
+        if event.get("impact") != "High":
+            continue
+        try:
+            when = datetime.fromisoformat(event["date"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        events.append({**event, "when": when})
+    _news_cache = (time.monotonic(), events)
+    return events
+
+
+def upcoming_news(
+    events: list[dict], asset: str, now: datetime,
+    hours: float = NEWS_WINDOW_HOURS,
+) -> list[dict]:
+    """High-impact events for this asset's currencies in the next `hours`."""
+    currencies = news_currencies(asset) | {"All"}
+    return sorted(
+        (e for e in events
+         if e.get("country") in currencies
+         and now <= e["when"] <= now + timedelta(hours=hours)),
+        key=lambda e: e["when"],
+    )
+
+
+def news_note(events: list[dict], now: datetime) -> Optional[str]:
+    """A short warning listing upcoming events, in local time."""
+    if not events:
+        return None
+    lines = []
+    for event in events[:4]:
+        minutes = int((event["when"] - now).total_seconds() // 60)
+        until = f"{minutes // 60}h {minutes % 60}m" if minutes >= 60 else f"{minutes}m"
+        at = event["when"].astimezone(LOCAL_TZ).strftime("%H:%M")
+        lines.append(f"• {event['country']} {event['title']} at {at} (in {until})")
+    more = f"\n…and {len(events) - 4} more" if len(events) > 4 else ""
+    return (f"📰 High-impact news within {NEWS_WINDOW_HOURS}h — expect volatility:\n"
+            + "\n".join(lines) + more)
+
+
+async def news_warning(asset: str) -> Optional[str]:
+    """The news warning for a new signal, or None (never raises)."""
+    try:
+        now = datetime.now(dt_timezone.utc)
+        return news_note(upcoming_news(await high_impact_events(), asset, now), now)
+    except Exception:  # noqa: BLE001 - a warning is not worth failing a signal over
+        logger.warning("News check failed for %s", asset, exc_info=True)
+        return None
+
+
+def build_trade(
+    chat_id: int, data: TradeData, market: dict, decimals: int, *,
+    order_type: str, status: str, fill_direction: Optional[str],
+) -> dict:
+    """A new monitored trade, as stored in state["trades"]."""
+    profit, loss = calculate_percentages(data)
+    return {
+        # Lets the buttons and reply-edits find this trade again
+        "id": secrets.token_hex(4),
+        "chat_id": chat_id,
+        "asset": data.asset.upper(),
+        "provider": market["provider"],
+        "symbol": market["symbol"],
+        "direction": data.direction,
+        "entry": data.entry,
+        "sl": data.stop_loss,
+        "tp": data.take_profit,
+        "be_price": breakeven_price(data),
+        "be_alerted": False,
+        "decimals": decimals,
+        "profit_pct": profit,
+        "loss_pct": loss,
+        "order_type": order_type,
+        "status": status,
+        "fill_direction": fill_direction,
+        "created_at": utcnow_iso(),
+        "feed_version": FEED_VERSION,
+    }
+
+
+# A running-trade offer can be accepted for this long
+OFFER_TTL_HOURS = 24
+
+
+def offer_running_trade(
+    chat_id: int, analysis: ChartAnalysis, data: TradeData, market: Optional[dict]
+) -> Optional[str]:
+    """Store the chart's already-running trade so a button can monitor it.
+
+    Only when all three levels were read, they make a coherent setup, and a
+    feed carries the asset. Returns the offer's id, or None.
+    """
+    running = analysis.active_position
+    if running is None or market is None:
+        return None
+    levels = (running.entry, running.stop_loss, running.take_profit)
+    if any(v is None for v in levels):
+        return None
+    candidate = TradeData(
+        asset=data.asset, direction=running.direction, entry=running.entry,
+        stop_loss=running.stop_loss, take_profit=running.take_profit,
+    )
+    if validate(candidate):
+        return None
+
+    now = datetime.now(dt_timezone.utc)
+    offers = state["offers"]
+    for stale in [k for k, o in offers.items()
+                  if now - datetime.fromisoformat(o["created_at"])
+                  > timedelta(hours=OFFER_TTL_HOURS)]:
+        del offers[stale]
+    offer_id = secrets.token_hex(4)
+    offers[offer_id] = {
+        "chat_id": chat_id, "data": candidate.model_dump(),
+        "market": market, "created_at": now.isoformat(),
+    }
+    save_state()
+    return offer_id
+
+
+async def watch_running_trade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Button handler: start monitoring the chart's already-running trade."""
+    query = update.callback_query
+    offer_id = (query.data or "").partition(":")[2]
+    chat_id = query.message.chat_id if query.message else None
+    offer = state["offers"].get(offer_id)
+    if offer is None or offer["chat_id"] != chat_id:
+        await query.answer("That offer has expired — send the chart again.")
+        return
+    del state["offers"][offer_id]
+
+    data = TradeData(**offer["data"])
+    if find_duplicate_trade(chat_id, data, offer["market"]["symbol"]):
+        save_state()
+        await query.answer("Already monitoring that one.")
+        return
+    side = "SELL" if data.direction == "SHORT" else "BUY"
+    trade = build_trade(
+        chat_id, data, offer["market"], signal_decimals(data),
+        order_type=f"{side} (running)", status="active", fill_direction=None,
+    )
+    state["trades"].append(trade)
+    save_state()
+    logger.info("Watching running %s %s in chat %s", trade["asset"], side, chat_id)
+
+    await query.answer("Now monitoring it ✅")
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:  # noqa: BLE001 - cosmetic
+        pass
+    sent = await deliver(
+        context, chat_id, monitoring_status_text(trade),
+        reply_markup=correction_buttons(trade))
+    remember_message(trade, sent)
+    save_state()
 
 
 def monitoring_status_text(trade: dict) -> str:
@@ -1530,10 +2073,14 @@ def monitoring_status_text(trade: dict) -> str:
     how = ("market execution: the entry was at the market price, so I'm "
            "treating this as open now" if order.endswith("MARKET")
            else "triggered: price reached the entry, so the position is open")
+    if trade.get("tp1_hit"):
+        return (f"🔒 {order} — TP1 banked, SL at entry. Watching for TP2 at "
+                f"{trade['tp2']:.{decimals}f}.")
+    targets = ("TP1, TP2" if trade.get("tp2") else "TP")
     return (
         f"🔴 {order} — {how}.\n"
         f"I'll alert you to move SL to breakeven at {be_price} (30% of the "
-        "way to TP), and again when TP or SL is hit."
+        f"way to TP), and again when {targets} or SL is hit."
     )
 
 
@@ -1596,6 +2143,129 @@ async def correct_trade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         logger.warning("Could not update the status message", exc_info=True)
 
 
+# Reply-to-edit: "sl 4170", "tp 4195", "tp2 4210", "entry 4166", "be", "cancel"
+EDIT_TOKEN = re.compile(
+    r"\b(sl|tp2|tp1|tp|entry)\s*[:=]?\s*(be|breakeven|\d[\d,]*(?:\.\d+)?)", re.I)
+EDIT_HELP = (
+    "To change this trade, reply to any of my messages about it with:\n"
+    "sl 4170 · be (SL to entry) · tp 4195 · tp2 4210 · entry 4166 · cancel\n"
+    "Several at once work too: sl 4170 tp2 4210"
+)
+
+
+def parse_edits(text: str) -> Optional[dict]:
+    """The changes a reply asks for, e.g. {"sl": 4170.0, "tp2": 4210.0}.
+
+    "be" or "breakeven" means SL to entry, returned as {"sl": "be"}, and
+    "cancel"/"close"/"stop" as {"cancel": True}. None if nothing parses.
+    """
+    words = text.strip().lower()
+    if words in ("cancel", "close", "stop", "remove", "delete"):
+        return {"cancel": True}
+    if words in ("be", "breakeven", "sl be", "sl to be", "sl to breakeven"):
+        return {"sl": "be"}
+    edits: dict = {}
+    for field, value in EDIT_TOKEN.findall(text):
+        field = "tp" if field.lower() == "tp1" else field.lower()
+        if value.lower() in ("be", "breakeven"):
+            if field != "sl":
+                return None
+            edits[field] = "be"
+        else:
+            edits[field] = float(value.replace(",", ""))
+    return edits or None
+
+
+def apply_edits(trade: dict, edits: dict) -> str:
+    """Apply parsed edits to a trade; the confirmation, or raise ValueError.
+
+    Checked on a copy first, so an edit that would leave the levels on the
+    wrong sides of the entry changes nothing.
+    """
+    new = dict(trade)
+    for field, value in edits.items():
+        new[field] = new["entry"] if value == "be" else value
+    long = new["direction"] == "LONG"
+    entry, sl, tp, tp2 = new["entry"], new["sl"], new["tp"], new.get("tp2")
+    if min(v for v in (entry, sl, tp, tp2) if v is not None) <= 0:
+        raise ValueError("prices must be above zero")
+    if long and not (sl <= entry < tp):
+        raise ValueError("a BUY needs SL at or below the entry and TP above it")
+    if not long and not (sl >= entry > tp):
+        raise ValueError("a SELL needs SL at or above the entry and TP below it")
+    if tp2 is not None and (tp2 <= tp if long else tp2 >= tp):
+        raise ValueError("TP2 must be further than TP1")
+
+    if "entry" in edits and new.get("status") == "pending":
+        # Which side of the market the entry sits on may have changed;
+        # the next price reading settles it again (and LIMIT vs STOP)
+        new["fill_direction"] = None
+        new["order_type"] = "SELL" if not long else "BUY"
+    if "sl" in edits and sl == entry:
+        new["be_alerted"] = True  # nothing left to remind about
+    new["be_price"] = entry + (tp - entry) * BREAKEVEN_FRACTION
+    new["profit_pct"] = round(abs(move_pct(new, tp)), 2)
+    new["loss_pct"] = round(max(0.0, -move_pct(new, sl)), 2)
+    new["decimals"] = max(
+        new.get("decimals", 2),
+        *(_natural_decimals(v) for v in (entry, sl, tp, tp2) if v is not None))
+    trade.update(new)
+
+    d = trade["decimals"]
+    names = {"sl": "SL", "tp": "TP" if trade.get("tp2") is None else "TP1",
+             "tp2": "TP2", "entry": "Entry"}
+    changes = [
+        "SL moved to breakeven ({:.{d}f})".format(entry, d=d) if value == "be"
+        else f"{names[field]} → {trade[field]:.{d}f}"
+        for field, value in edits.items()
+    ]
+    return f"✏️ {trade['asset']}: " + " · ".join(changes)
+
+
+def trade_for_reply(chat_id: int, message_id: int) -> Optional[dict]:
+    """The monitored trade a message of ours was about, if any."""
+    for trade in state["trades"]:
+        if trade["chat_id"] == chat_id and message_id in trade.get("msg_ids", []):
+            return trade
+    return None
+
+
+async def edit_trade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """A reply to one of the bot's trade messages: change that trade."""
+    message = update.effective_message
+    target = message.reply_to_message if message else None
+    if (target is None or target.from_user is None
+            or target.from_user.id != context.bot.id or not message.text):
+        return
+    edits = parse_edits(message.text)
+    trade = trade_for_reply(message.chat_id, target.message_id)
+    if trade is None:
+        if edits:
+            await message.reply_text("That trade isn't being monitored any more.")
+        return
+    if edits is None:
+        await message.reply_text(EDIT_HELP)
+        return
+
+    if edits.get("cancel"):
+        state["trades"].remove(trade)
+        record_result(trade, "cancelled")
+        save_state()
+        await message.reply_text(
+            f"🗑️ Stopped monitoring {trade['asset']}. No further alerts for it.")
+        return
+    try:
+        confirmation = apply_edits(trade, edits)
+    except ValueError as error:
+        await message.reply_text(f"⚠️ Not changed: {error}.")
+        return
+    save_state()
+    logger.info("%s in chat %s edited: %s", trade["asset"], message.chat_id, edits)
+    sent = await message.reply_text(confirmation)
+    remember_message(trade, sent)
+    save_state()
+
+
 # ---------------------------------------------------------------------------
 # Telegram handlers
 # ---------------------------------------------------------------------------
@@ -1611,12 +2281,125 @@ async def list_trades(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "start one."
         )
         return
-    lines = [describe_trade(t, i) for i, t in enumerate(trades, start=1)]
+    prices = await current_prices(trades)
+    lines = [
+        describe_trade(t, i, prices.get((t.get("provider"), t.get("symbol"))))
+        for i, t in enumerate(trades, start=1)
+    ]
     await message.reply_text(
         f"📋 {len(trades)} monitored — ⏳ pending · 🔴 live · 🔒 at breakeven\n"
         + "\n".join(lines)
         + "\n\n/cancel <number> · /cancel all"
     )
+
+
+# The group's local time, for the weekly summary and news times
+LOCAL_TZ = ZoneInfo(os.environ.get("LOCAL_TIMEZONE", "Africa/Lagos"))
+
+
+def results_since(chat_id: int, since: Optional[datetime]) -> list[dict]:
+    """This chat's closed trades, newest last, closed at or after `since`."""
+    out = []
+    for record in state["history"]:
+        if record["chat_id"] != chat_id:
+            continue
+        if since is not None:
+            try:
+                if datetime.fromisoformat(record["closed_at"]) < since:
+                    continue
+            except (KeyError, ValueError):
+                continue
+        out.append(record)
+    return out
+
+
+def summarize_results(records: list[dict], title: str) -> str:
+    """Win rate, net result and best/worst assets for a set of closed trades.
+
+    Percentages are price moves from entry, not account returns — the bot
+    never knows position size.
+    """
+    taken = [r for r in records if r.get("pnl_pct") is not None]
+    not_taken = [r for r in records if r.get("pnl_pct") is None]
+    if not taken:
+        return f"📊 {title}\nNo trades closed yet."
+
+    wins = [r["pnl_pct"] for r in taken if r["pnl_pct"] > 0]
+    losses = [r["pnl_pct"] for r in taken if r["pnl_pct"] < 0]
+    flat = len(taken) - len(wins) - len(losses)
+    decided = len(wins) + len(losses)
+    lines = [
+        f"📊 {title}",
+        f"{len(taken)} closed · ✅ {len(wins)} won · ❌ {len(losses)} lost"
+        + (f" · 🔒 {flat} breakeven" if flat else ""),
+    ]
+    if decided:
+        lines.append(f"Win rate: {len(wins) / decided * 100:.0f}%"
+                     + (" (breakeven not counted)" if flat else ""))
+    net = sum(r["pnl_pct"] for r in taken)
+    detail = [f"Net: {net:+.2f}%"]
+    if wins:
+        detail.append(f"avg win +{sum(wins) / len(wins):.2f}%")
+    if losses:
+        detail.append(f"avg loss {sum(losses) / len(losses):.2f}%")
+    lines.append(" · ".join(detail))
+
+    by_asset: dict[str, list[float]] = {}
+    for r in taken:
+        by_asset.setdefault(r["asset"], []).append(r["pnl_pct"])
+    if len(by_asset) > 1:
+        ranked = sorted(by_asset.items(), key=lambda kv: sum(kv[1]))
+        (worst, w), (best, b) = ranked[0], ranked[-1]
+        lines.append(f"Best: {best} {sum(b):+.2f}% ({len(b)}) · "
+                     f"Worst: {worst} {sum(w):+.2f}% ({len(w)})")
+
+    if not_taken:
+        counts: dict[str, int] = {}
+        for r in not_taken:
+            counts[r["result"]] = counts.get(r["result"], 0) + 1
+        lines.append("Not taken: " + " · ".join(
+            f"{n} {result}" for result, n in sorted(counts.items())))
+    lines.append("(% = price move from entry; a TP2 trade counts half at TP1)")
+    return "\n".join(lines)
+
+
+async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/stats [days|all] — results for this chat, last 30 days by default."""
+    message = update.effective_message
+    arg = context.args[0].lower() if context.args else "30"
+    if arg == "all":
+        since, title = None, "Results — all time"
+    elif arg.isdigit() and int(arg) > 0:
+        since = datetime.now(dt_timezone.utc) - timedelta(days=int(arg))
+        title = f"Results — last {int(arg)} day{'s' if int(arg) != 1 else ''}"
+    else:
+        await message.reply_text("Use /stats, /stats 7 (days) or /stats all.")
+        return
+    await message.reply_text(
+        summarize_results(results_since(message.chat_id, since), title))
+
+
+async def weekly_summary(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Sunday evening: the week's results to every chat that closed a trade."""
+    since = datetime.now(dt_timezone.utc) - timedelta(days=7)
+    chats = {r["chat_id"] for r in results_since_any(since)}
+    for chat_id in chats:
+        records = results_since(chat_id, since)
+        if any(r.get("pnl_pct") is not None for r in records):
+            await deliver(context, chat_id,
+                          summarize_results(records, "This week's results 🗓️"))
+
+
+def results_since_any(since: datetime) -> list[dict]:
+    """Every chat's closed trades since `since`."""
+    out = []
+    for record in state["history"]:
+        try:
+            if datetime.fromisoformat(record["closed_at"]) >= since:
+                out.append(record)
+        except (KeyError, ValueError):
+            continue
+    return out
 
 
 async def cancel_trade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1632,6 +2415,7 @@ async def cancel_trade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if arg == "all" or (not arg and len(trades) == 1):
         for trade in trades:
             state["trades"].remove(trade)
+            record_result(trade, "cancelled")
         save_state()
         await message.reply_text(
             f"🗑️ Stopped monitoring {len(trades)} trade(s). No further alerts."
@@ -1654,6 +2438,7 @@ async def cancel_trade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     trade = trades[int(arg) - 1]
     state["trades"].remove(trade)
+    record_result(trade, "cancelled")
     save_state()
     await message.reply_text(
         f"🗑️ Stopped monitoring {trade['asset']} {trade['direction']}. "
@@ -1725,19 +2510,28 @@ async def handle_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 live_price = await fetch_market_price(http, market)
 
         decimals = signal_decimals(data)
-        await message.reply_text(build_signal_message(data, live_price))
+        signal_message = await message.reply_text(build_signal_message(data, live_price))
 
-        context_note = describe_chart_context(analysis, data, decimals)
+        offer_id = offer_running_trade(message.chat_id, analysis, data, market)
+        context_note = describe_chart_context(
+            analysis, data, decimals, offered=offer_id is not None)
         if context_note:
-            await message.reply_text(context_note)
+            await message.reply_text(context_note, reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("👀 Watch this one too",
+                                       callback_data=f"run:{offer_id}")]]
+            ) if offer_id else None)
 
+        news = await news_warning(data.asset)
         if not market:
-            # The signal alone is the reply: the chat doesn't want a notice
-            # that alerts are off, so it only goes to the log.
+            # The signal is the reply: the chat doesn't want a notice that
+            # alerts are off, so that only goes to the log. News still
+            # matters for a trade nobody is watching, so it's sent if due.
             logger.info(
                 "Not monitoring %s: %s", data.asset.upper(),
                 unmonitored_reason(data.asset) or "no price feed lists it",
             )
+            if news:
+                await message.reply_text(news)
             return
 
         symbol = market["symbol"]
@@ -1751,41 +2545,27 @@ async def handle_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
             return
 
-        be_price = breakeven_price(data)
-        profit, loss = calculate_percentages(data)
         fill = entry_fill_direction(data, live_price)
-        trade = {
-            # Lets the correction buttons find this trade again
-            "id": secrets.token_hex(4),
-            "chat_id": message.chat_id,
-            "asset": data.asset.upper(),
-            "provider": market["provider"],
-            "symbol": symbol,
-            "direction": data.direction,
-            "entry": data.entry,
-            "sl": data.stop_loss,
-            "tp": data.take_profit,
-            "be_price": be_price,
-            "be_alerted": False,
-            "decimals": decimals,
-            "profit_pct": profit,
-            "loss_pct": loss,
-            "order_type": determine_order_type(data, live_price),
-            # A pending order isn't a position yet — no TP/SL/breakeven alerts
-            # until price actually touches the entry level.
-            "status": "pending" if fill else "active",
+        trade = build_trade(
+            message.chat_id, data, market, decimals,
+            order_type=determine_order_type(data, live_price),
+            # A pending order isn't a position yet — no TP/SL/breakeven
+            # alerts until price actually touches the entry level.
+            status="pending" if fill else "active",
             # "unknown" means we never established which side of the market
-            # entry sits on; check_trade then fills on any touch either way.
-            "fill_direction": fill if fill in ("up", "down") else None,
-            "created_at": utcnow_iso(),
-            "feed_version": FEED_VERSION,
-        }
+            # entry sits on; the first price reading settles it.
+            fill_direction=fill if fill in ("up", "down") else None,
+        )
         state["trades"].append(trade)
         save_state()
 
-        await message.reply_text(
-            monitoring_status_text(trade), reply_markup=correction_buttons(trade)
+        status_message = await message.reply_text(
+            monitoring_status_text(trade) + (f"\n\n{news}" if news else ""),
+            reply_markup=correction_buttons(trade),
         )
+        remember_message(trade, signal_message)
+        remember_message(trade, status_message)
+        save_state()
     except Exception as error:
         logger.exception("Failed to process chart")
         if is_retryable(error):
@@ -1846,8 +2626,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "I read from the chart whether you're in at market or waiting on a "
         "pending LIMIT/STOP order (one tap fixes it if I guess wrong), then "
         "monitor the trade: when a pending order fills, when to move SL to "
-        "breakeven at 30% of the way to TP, and when TP or SL is hit.\n\n"
-        "/trades — what I'm currently watching\n"
+        "breakeven at 30% of the way to TP, and when TP or SL is hit. I also "
+        "warn you about high-impact news due within 4 hours.\n\n"
+        "Changed your trade? Reply to any of my messages about it:\n"
+        "sl 4170 · be (SL to entry) · tp 4195 · tp2 4210 · entry 4166 · cancel\n\n"
+        "/trades — what I'm watching, with live prices\n"
+        "/stats — your results (/stats 7, /stats all)\n"
         "/cancel — stop watching a trade"
         + (f"\n\n{warning}" if warning else "")
     )
@@ -1855,9 +2639,86 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 BOT_COMMANDS = [
     ("start", "How to use the bot"),
-    ("trades", "List trades being monitored"),
+    ("trades", "Trades being monitored, with live prices"),
+    ("stats", "Results: /stats, /stats 7, /stats all"),
     ("cancel", "Stop monitoring a trade"),
 ]
+
+
+# ---------------------------------------------------------------------------
+# Error alerts to the bot owner
+# ---------------------------------------------------------------------------
+
+# Telegram user id that receives error alerts; leave unset to disable
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "").strip()
+ALERT_INTERVAL = 30          # seconds between alert batches
+ALERT_REPEAT_MINUTES = 30    # the same error is reported at most this often
+
+
+class AdminAlerts(logging.Handler):
+    """Collects every ERROR log record so a job can message them to the owner.
+
+    Logging is synchronous and the bot is async, so records only queue here;
+    flush_admin_alerts sends them. The same error (by logger and message) is
+    reported once per ALERT_REPEAT_MINUTES with a count of repeats, so a feed
+    that fails every few seconds can't flood the chat.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(logging.ERROR)
+        self.pending: collections.deque = collections.deque(maxlen=100)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            text = record.getMessage()
+            if record.exc_info and record.exc_info[1] is not None:
+                error = record.exc_info[1]
+                text += f"\n{type(error).__name__}: {error}"
+            self.pending.append(((record.name, record.getMessage()[:100]), text[:600]))
+        except Exception:  # noqa: BLE001 - a log handler must never raise
+            pass
+
+
+admin_alerts = AdminAlerts()
+_alerted_at: dict[tuple, float] = {}
+_suppressed: dict[tuple, int] = {}
+
+
+async def flush_admin_alerts(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Job: send queued errors to the owner, de-duplicated."""
+    lines = []
+    now = time.monotonic()
+    while admin_alerts.pending:
+        key, text = admin_alerts.pending.popleft()
+        if now - _alerted_at.get(key, float("-inf")) < ALERT_REPEAT_MINUTES * 60:
+            _suppressed[key] = _suppressed.get(key, 0) + 1
+            continue
+        repeats = _suppressed.pop(key, 0)
+        _alerted_at[key] = now
+        lines.append(f"• {text}" + (f"\n  (+{repeats} more since last alert)"
+                                     if repeats else ""))
+    if not lines:
+        return
+    text = f"🚨 Bot error{'s' if len(lines) > 1 else ''}:\n" + "\n".join(lines)
+    try:
+        await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=text[:4000])
+    except Exception as error:  # noqa: BLE001
+        # WARNING, not ERROR: failing to alert must not queue another alert
+        logger.warning("Could not send the error alert: %s", error)
+
+
+async def announce_start(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Tell the owner the bot (re)started — every deploy and every crash."""
+    try:
+        await context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=f"✅ Bot started — monitoring {len(state['trades'])} trade(s)"
+                 + (", trades loaded from Upstash" if remote_state.ready else
+                    "" if not remote_state.enabled else
+                    " ⚠️ could not read Upstash, saving to it is OFF this run"),
+        )
+    except Exception as error:  # noqa: BLE001
+        logger.warning("Could not send the start-up notice: %s", error)
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1914,15 +2775,28 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("trades", list_trades))
     app.add_handler(CommandHandler("cancel", cancel_trade))
+    app.add_handler(CommandHandler("stats", show_stats))
     app.add_handler(CallbackQueryHandler(correct_trade, pattern=r"^(in|wait):"))
+    app.add_handler(CallbackQueryHandler(watch_running_trade, pattern=r"^run:"))
+    # Replies to the bot's trade messages edit that trade ("sl 4170", "be"...)
+    app.add_handler(MessageHandler(
+        filters.REPLY & filters.TEXT & ~filters.COMMAND, edit_trade))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_chart))
     app.add_error_handler(on_error)
+
+    if ADMIN_CHAT_ID:
+        logging.getLogger().addHandler(admin_alerts)
+        app.job_queue.run_repeating(flush_admin_alerts, interval=ALERT_INTERVAL, first=ALERT_INTERVAL)
+        app.job_queue.run_once(announce_start, when=5)
 
     # Each run samples the price range since the previous one, so a tick
     # missed while the host slept is covered by the next one's lookback
     # rather than lost. A run that would overlap a still-running one is
     # skipped by the scheduler, which FEED_TIMEOUT keeps from happening.
     app.job_queue.run_repeating(monitor_trades, interval=MONITOR_INTERVAL, first=10)
+    # Sunday 20:00 local time (0 = Sunday in python-telegram-bot's numbering)
+    app.job_queue.run_daily(
+        weekly_summary, time=dt_time(20, 0, tzinfo=LOCAL_TZ), days=(0,))
 
     logger.info(
         "Monitoring %d trade(s) every %gs on interval high/low",

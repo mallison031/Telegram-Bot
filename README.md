@@ -20,6 +20,59 @@ one tap to correct it if it guessed wrong.
 See `telegram_bot_roadmap.md` for the full design. Automated broker execution
 is shelved — see the status note in `MT5_MOBILE_AUTOMATION.md`.
 
+## What the bot can do
+
+**Read charts**
+- Turns a chart screenshot (photo or image file) into a signal: asset,
+  direction, entry, SL, TP, and profit/loss % — the math is done in code,
+  never by the AI.
+- Tells the five order types apart: **BUY LIMIT, BUY STOP, SELL LIMIT,
+  SELL STOP** and **MARKET execution**, judged from the chart itself.
+- Reads the **most recent** position when several are drawn, and points out
+  another trade on the chart that is **already running**, with a
+  `👀 Watch this one too` button to monitor it as well.
+- Understands broker symbols like Exness's `XAUUSDm`, `EURUSDc` or `US30.cash`.
+- Ignores text messages and images that aren't trading charts.
+- Uses a free vision model on Groq, with Gemini's free tier as a **backup**
+  when Groq's per-minute limit is full (optional key).
+
+**Monitor trades live** — gold, silver, forex and crypto
+- Pending orders: alerts when the order **triggers** (`✅ XAUUSD BUY STOP
+  triggered`), or when price ran to TP without ever filling it.
+- Open trades: **move-SL-to-breakeven** alert at 30% of the way to TP, then
+  **TP** or **SL** hit alerts.
+- **Two take-profit levels**: at TP1 it says to close half and move SL to
+  entry, then watches for TP2.
+- Checks gold, silver and forex every 5 s on a real broker's live bid/ask
+  (Swissquote), and crypto on 1-minute candles (Coinbase) so no wick is missed.
+- Any number of trades at once, one request per market however many trades
+  share it.
+- Indices and oil (US30, NAS100, WTI…) get the signal but no alerts — no free
+  real-time feed exists for them.
+
+**Let you manage trades**
+- One tap to correct a wrong market/pending guess.
+- **Reply to any of its messages** to change that trade: `sl 4170`, `be`
+  (SL to entry), `tp 4195`, `tp2 4210`, `entry 4166`, `cancel`.
+- `/trades` — every monitored trade with its **live price** and progress
+  (`now 4174.00 · +0.19% · 📈 50% of the way to TP`).
+- `/cancel` — stop monitoring one trade or all of them.
+
+**Keep you informed**
+- **News warnings**: high-impact news (CPI, NFP, rate decisions…) due within
+  4 hours for that market's currencies is listed on the signal.
+- **Results**: `/stats` shows win rate, net result and best/worst assets
+  (last 30 days, `/stats 7`, or `/stats all`), plus an automatic summary
+  every **Sunday at 20:00** Lagos time.
+
+**Run reliably**
+- Trades and results **survive restarts and deploys** when Upstash (free) is
+  set up.
+- **Error alerts to the owner** on Telegram, plus a notice whenever the bot
+  starts (optional `ADMIN_CHAT_ID`).
+- Works in private chats, groups and channels; free hosting on Render.
+- An automated test suite runs on every push to GitHub.
+
 ## Setup (one time)
 
 1. **Create the Telegram bot** — message [@BotFather](https://t.me/BotFather),
@@ -125,13 +178,33 @@ drawn on it — you'll get the formatted signal back in a few seconds.
 - **No duplicates, no stale trades** — re-sending the same chart won't
   register the trade twice, and monitoring stops on its own after
   `TRADE_TTL_HOURS` (default 72) if nothing has resolved.
+- **Change a trade by replying to it** — reply to any of the bot's messages
+  about a trade: `sl 4170`, `be` (SL to entry), `tp 4195`, `tp2 4210`,
+  `entry 4166`, or `cancel`; several at once work (`sl 4170 tp2 4210`). An
+  edit that would put a level on the wrong side of the entry is refused and
+  changes nothing. Replies reach the bot even with group privacy mode on.
+- **Two take-profit levels** — add a TP2 by replying `tp2 4210`. At TP1 the
+  bot says to close half and move the stop to entry, then watches for TP2
+  with the stop treated as the entry (a return to entry is reported as
+  breakeven, not a loss).
+- **Watch the running trade too** — when a chart also shows a trade already
+  in progress, its note carries a `👀 Watch this one too` button (when all
+  three of its levels were read and a feed carries the asset).
+- **News warnings** — if high-impact news for the market's currencies is due
+  within 4 hours (ForexFactory's public calendar), the status message lists
+  it. Gold, crypto and US indices count as USD; GER40 as EUR, and so on.
+- **Results** — every closed trade is logged; `/stats` shows win rate, net
+  result and best/worst assets, and every chat that closed a trade gets a
+  summary on Sunday at 20:00 Lagos time. Percentages are price moves from
+  entry (the bot never knows position size); a TP2 trade counts half at TP1.
 
 ### Commands
 
 | Command | What it does |
 | --- | --- |
 | `/start` | Usage hint |
-| `/trades` | One line per monitored trade: `⏳` pending · `🔴` live · `🔒` at breakeven |
+| `/trades` | Each monitored trade with its live price: `now 4174.00 · +0.19% · 📈 50% of the way to TP` |
+| `/stats [days\|all]` | Results for this chat — last 30 days by default |
 | `/cancel [n\|all]` | Stop monitoring one trade (or all of them) |
 
 The command menu is registered with Telegram automatically at startup.
@@ -391,37 +464,55 @@ the free plan's 750 instance-hours per month, so it fits.
 
 ### Where state lives
 
-Monitored trades and the chat list are stored in `state.json` (gitignored — it
-holds your chat IDs and open positions, so don't commit it). Writes go through
-a temp file and an atomic rename, so a crash mid-write can't truncate it.
+Monitored trades, results and the chat list are written to `state.json`
+(gitignored — it holds your chat IDs and positions) through a temp file and an
+atomic rename, so a crash mid-write can't truncate it. **On Render's free tier
+that file is wiped on every redeploy and restart.**
 
-**On the free tier this file is wiped on every redeploy and restart** —
-monitored trades are forgotten, and no breakeven/TP/SL alert can fire for a
-trade registered before the last deploy. Re-send the chart to re-register.
-After the alert fixes, this is the most likely reason a real alert never
-arrives, so check `/trades` first.
+To keep trades through restarts, set `UPSTASH_REDIS_REST_URL` and
+`UPSTASH_REDIS_REST_TOKEN` (a free Redis database at
+[console.upstash.com](https://console.upstash.com) → your database → REST API).
+The bot then loads its state from Upstash at startup and saves to it in the
+background whenever a trade changes — not on every price poll, so it stays far
+inside the free 500K requests a month. If Upstash can't be read at startup,
+the bot refuses to write to it for that run, so a network blip can never
+replace your stored trades with an empty list (with `ADMIN_CHAT_ID` set, the
+start-up notice tells you).
 
-To make trades survive, Render requires a paid instance (~$7/month) — disks
-are not offered on free instances. Switch `render.yaml` to `plan: starter` and
-add:
+### Optional extras
 
-```yaml
-    disk:
-      name: bot-state
-      mountPath: /var/data
-      sizeGB: 1
-    envVars:
-      - key: STATE_FILE
-        value: /var/data/state.json
+| Variable | Turns on |
+| --- | --- |
+| `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN` | Trades and results survive restarts |
+| `GEMINI_API_KEY` | Backup chart reader: a chart that finds Groq's per-minute limit full goes to Gemini's free tier instead of waiting |
+| `ADMIN_CHAT_ID` | Your Telegram user id ([@userinfobot](https://t.me/userinfobot)): every logged error is messaged to you, batched every 30 s with repeats silenced for 30 min, plus a notice whenever the bot starts |
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest -q                                       # offline, under a second
+RUN_LIVE_VISION=1 pytest tests/test_live_vision.py   # real chart reading, ~4 min
 ```
+
+The offline suite fakes every external service — the vision model, price
+feeds, Upstash and Telegram — and covers order types, TP/SL/breakeven
+detection, TP2, reply edits, results, saving, the backup reader, news and
+whole chart flows. It never touches the real Upstash database, even with its
+keys in `.env`. The live test draws one chart per order type (BUY/SELL ×
+LIMIT/STOP/MARKET) and checks the real model reads every level exactly.
+
+GitHub Actions runs the offline suite on every push. The live test runs only
+when started by hand from the Actions tab with "live" ticked, and needs the
+`GROQ_API_KEY` repository secret.
 
 ## Troubleshooting
 
 **A TP or SL alert didn't arrive.** Check, in order:
 
 1. **Is the trade still registered?** Send `/trades`. If it isn't listed, it
-   isn't being watched — a free-tier redeploy wipes `state.json`. Re-send the
-   chart to re-register.
+   isn't being watched — without Upstash set up, a free-tier redeploy wipes
+   it. Re-send the chart to re-register.
 2. **Was the service awake?** A sleeping service runs no monitoring job at
    all. On waking, the next cycle looks back over the gap (up to
    `MAX_LOOKBACK_MINUTES`, 180) and will still report a level crossed while it
