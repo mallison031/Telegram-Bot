@@ -558,23 +558,29 @@ def determine_order_type(
     becomes a position once price travels to it, and whether it is a LIMIT or
     a STOP depends on which side of the market it sits.
     """
-    action = "SELL" if data.direction == "SHORT" else "BUY"
-    fill = entry_fill_direction(data, live_price)
+    return order_type_for(data.direction, entry_fill_direction(data, live_price))
+
+
+def order_type_for(direction: str, fill: Optional[str]) -> str:
+    """BUY/SELL plus MARKET, LIMIT or STOP, from which way price must travel
+    to reach the entry (None: it's already there).
+
+        BUY LIMIT   buy below the market  — waits for price to drop to entry
+        BUY STOP    buy above the market  — waits for price to rise to entry
+        SELL LIMIT  sell above the market — waits for price to rise to entry
+        SELL STOP   sell below the market — waits for price to drop to entry
+    """
+    action = "SELL" if direction == "SHORT" else "BUY"
     if fill is None:
         return f"{action} MARKET"
-    if fill == "unknown":
+    if fill not in ("up", "down"):
         # Pending, but with no price reference there is no way to say which
         # side of the market the entry sits on, and LIMIT vs STOP is exactly
         # that question. Better to name neither than to guess wrong.
         return action
-
-    if data.direction == "SHORT":
-        # Selling above the market waits for price to rise -> LIMIT
-        order = "LIMIT" if fill == "up" else "STOP"
-    else:
-        # Buying below the market waits for price to fall -> LIMIT
-        order = "LIMIT" if fill == "down" else "STOP"
-    return f"{action} {order}"
+    # A limit order waits for a better price, a stop order for a worse one
+    better = "down" if action == "BUY" else "up"
+    return f"{action} {'LIMIT' if fill == better else 'STOP'}"
 
 
 def _natural_decimals(value: float) -> int:
@@ -1308,15 +1314,18 @@ async def apply_feed(
             # entry, which a single quote never does — so settle the side now
             # from where price actually is, and the next touch fills it.
             trade["fill_direction"] = "up" if trade["entry"] > sample.last else "down"
+            # Now that the side is known, so is LIMIT vs STOP
+            trade["order_type"] = order_type_for(
+                trade["direction"], trade["fill_direction"])
         return
 
     if event == "entry":
         trade["status"] = "active"
         text = (
-            f"✅ {trade['asset']}: price touched your entry "
-            f"{trade['entry']:.{decimals}f} — the order should be "
-            "filled. Now watching for breakeven, TP and SL."
-        )
+            f"✅ {trade['asset']} {trade.get('order_type') or ''} triggered — "
+            f"price reached your entry {trade['entry']:.{decimals}f}, so the "
+            "order should be filled. Now watching for breakeven, TP and SL."
+        ).replace("  ", " ")
     elif event == "missed":
         trades.remove(trade)
         text = (
@@ -1504,21 +1513,25 @@ def monitoring_status_text(trade: dict) -> str:
     decimals = trade.get("decimals", 2)
     entry = f"{trade['entry']:.{decimals}f}"
     be_price = f"{trade['be_price']:.{decimals}f}"
+    order = trade.get("order_type") or trade["direction"]
     if trade.get("status") == "pending":
-        where = {"up": " — entry sits above the market",
-                 "down": " — entry sits below the market"}.get(
-                     trade.get("fill_direction"), "")
+        waits = {"up": f"waits for price to rise to {entry}",
+                 "down": f"waits for price to drop to {entry}"}.get(
+                     trade.get("fill_direction"), f"waits for price to reach {entry}")
         expiry = (
             f"\nMonitoring stops automatically after {TRADE_TTL_HOURS:g}h."
             if TRADE_TTL_HOURS > 0 else ""
         )
         return (
-            f"⏳ Pending order{where}, so nothing is open yet. I'll tell you "
-            f"when price reaches {entry}, then watch for breakeven "
+            f"⏳ {order} — pending order: it {waits}, so nothing is open "
+            f"yet. I'll tell you when it triggers, then watch for breakeven "
             f"({be_price}), TP and SL.{expiry}"
         )
+    how = ("market execution: the entry was at the market price, so I'm "
+           "treating this as open now" if order.endswith("MARKET")
+           else "triggered: price reached the entry, so the position is open")
     return (
-        "🔴 Treating this as open now — entry was at the market price.\n"
+        f"🔴 {order} — {how}.\n"
         f"I'll alert you to move SL to breakeven at {be_price} (30% of the "
         "way to TP), and again when TP or SL is hit."
     )

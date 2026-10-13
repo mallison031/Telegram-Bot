@@ -99,6 +99,18 @@ drawn on it — you'll get the formatted signal back in a few seconds.
   price actually touches your entry, then tells you the order should be
   filled. If price runs to TP without ever filling, it says so — and, in case
   you were in after all, that it hit TP.
+  The five order types, from where the entry sits against the price:
+
+  | Setup | Entry vs price | Order | Waits for price to |
+  | --- | --- | --- | --- |
+  | Long | below | `BUY LIMIT` | drop to entry |
+  | Long | above | `BUY STOP` | rise to entry |
+  | Short | above | `SELL LIMIT` | rise to entry |
+  | Short | below | `SELL STOP` | drop to entry |
+  | Either | on the latest candle | `BUY MARKET` / `SELL MARKET` | — open now |
+
+  Every message names the order: `⏳ BUY STOP — pending order: it waits for
+  price to rise to 4176.00`, then `✅ XAUUSD BUY STOP triggered` when it fills.
 - **One tap to correct it** — the message under each signal carries a button:
   `✅ I'm already in this trade` on a pending order, `⏳ It's a pending order`
   on an open one. A wrong guess silences every alert that follows, so fixing
