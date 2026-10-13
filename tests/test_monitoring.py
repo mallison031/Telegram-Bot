@@ -19,7 +19,27 @@ def test_pending_fills_in_the_direction_price_must_travel():
 
 def test_pending_that_reaches_tp_without_filling_is_missed():
     t = make_trade(status="pending", fill_direction="down")
+    assert bot.check_trade(t, S(4170, 4171, 4169)) is None  # between entry and TP
     assert bot.check_trade(t, S(4183, 4183, 4170)) == "missed"
+
+
+@pytest.mark.parametrize("direction, entry, sl, tp, fill", [
+    ("LONG", 4150, 4144, 4165, "down"),   # BUY LIMIT, price already above TP
+    ("SHORT", 4185, 4190, 4175, "up"),    # SELL LIMIT, price already below TP
+])
+def test_limit_placed_beyond_its_tp_is_not_missed(direction, entry, sl, tp, fill):
+    """Regression: a pullback limit order sent while price sat beyond its TP
+    was reported "missed" (and dropped) on the very first check."""
+    t = make_trade(status="pending", direction=direction, entry=entry, sl=sl,
+                   tp=tp, fill_direction=fill)
+    for _ in range(3):
+        assert bot.check_trade(t, S(4170.6, 4170.6, 4170.6)) is None
+    # Price pulls back between TP and entry: still waiting
+    between = 4158.0 if direction == "LONG" else 4180.0
+    assert bot.check_trade(t, S(between, between, between)) is None
+    # ...then reaches the entry: the order fills
+    at_entry = entry - 0.5 if direction == "LONG" else entry + 0.5
+    assert bot.check_trade(t, S(at_entry, at_entry, at_entry)) == "entry"
 
 
 def test_sl_is_reported_when_one_interval_spans_sl_and_tp():

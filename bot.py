@@ -1387,6 +1387,16 @@ def check_trade(trade: dict, sample: PriceSample) -> Optional[str]:
             touched = sample.low <= trade["entry"] <= sample.high
         if touched:
             return "entry"
+        # "Missed" means price travelled from the entry side of TP to TP
+        # without filling the order. A limit order is often placed with
+        # price already beyond its TP — a pullback entry — and then
+        # "reached TP" is simply where price started, not a missed trade.
+        # So the check is only armed once price has been seen between the
+        # entry and TP; until then, sitting beyond TP means nothing.
+        if not trade.get("missed_armed"):
+            if not reached(trade["tp"], sample.last):
+                trade["missed_armed"] = True
+            return None
         return "missed" if reached_tp else None
 
     # SL is checked before TP: when one interval spans both levels we cannot
@@ -1579,12 +1589,13 @@ async def apply_feed(
         trades.remove(trade)
         record_result(trade, "missed")
         text = (
-            f"🚪 {trade['asset']}: price reached TP "
-            f"({trade['tp']:.{decimals}f}) without coming back to your "
-            f"entry at {trade['entry']:.{decimals}f}, so a pending order "
-            "there never filled — no loss taken.\n"
-            "If you were actually already in this trade, it just hit TP 🎯"
-        )
+            f"🚪 {trade['asset']} {trade.get('order_type') or ''}: price ran "
+            f"to the TP level ({trade['tp']:.{decimals}f}) without reaching "
+            f"your entry at {trade['entry']:.{decimals}f}, so the order never "
+            "filled and I've stopped watching it. This is not a TP hit: "
+            "no position was opened, so no profit or loss.\n"
+            "If your order did fill, send the chart again and I'll watch it."
+        ).replace("  ", " ")
     elif event == "breakeven":
         trade["be_alerted"] = True
         text = (
