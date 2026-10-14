@@ -245,6 +245,44 @@ def test_backup_reader_answers_when_groq_is_full(monkeypatch):
     assert tried == ["bad", "g"]
 
 
+def test_invented_level_not_on_the_chart_is_retried(monkeypatch):
+    """Regression: Groq once read a SHORT's SL label as the entry, then
+    invented a new SL above it — internally consistent (SL > entry > TP) but
+    a number that was never printed on the chart. The model's own
+    price_axis_labels should catch that and trigger a retry."""
+    bad = bot.ChartAnalysis(
+        is_trading_chart=True, asset="XAUUSD", direction="SHORT",
+        entry=4180.120, stop_loss=4185.000, take_profit=4117.827,
+        price_axis_labels=[4180.120, 4173.226, 4117.827],
+    )
+    good = bot.ChartAnalysis(
+        is_trading_chart=True, asset="XAUUSD", direction="SHORT",
+        entry=4173.226, stop_loss=4180.120, take_profit=4117.827,
+        price_axis_labels=[4180.120, 4173.226, 4117.827],
+    )
+    monkeypatch.setattr(bot, "VISION_MODELS", [("groq", "q")])
+    replies = iter([bad, good])
+    monkeypatch.setattr(bot, "request_chart_analysis", lambda *a: next(replies))
+    monkeypatch.setattr(bot.time, "sleep", lambda s: None)
+    assert bot.extract_chart_analysis(b"img", "image/png") is good
+
+
+def test_labels_support_reading():
+    labelled = bot.ChartAnalysis(
+        is_trading_chart=True, direction="SHORT",
+        entry=4180.120, stop_loss=4185.000, take_profit=4117.827,
+        price_axis_labels=[4180.120, 4173.226, 4117.827],
+    )
+    assert not bot.labels_support_reading(labelled)
+
+    matching = labelled.model_copy(update={"entry": 4173.226, "stop_loss": 4180.120})
+    assert bot.labels_support_reading(matching)
+
+    # No labels offered at all: nothing to check against, so don't block it.
+    unlabelled = bot.ChartAnalysis(is_trading_chart=True, entry=4180.120)
+    assert bot.labels_support_reading(unlabelled)
+
+
 def test_all_bad_keys_fail_fast(monkeypatch):
     def bad(*a):
         raise bot.VisionAPIError("HTTP 401: bad key", False)

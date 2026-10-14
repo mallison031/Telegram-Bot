@@ -27,6 +27,7 @@ import base64
 import collections
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -587,6 +588,13 @@ class ChartAnalysis(BaseModel):
     # A different position tool that price is currently inside — a trade
     # already running, as opposed to the setup being signalled.
     active_position: Optional[ActivePosition] = None
+    # Every distinct price number printed on the chart for the position tool
+    # returned above (its entry, stop loss and take profit labels, plus the
+    # current-price label). Lets entry/stop_loss/take_profit be checked
+    # against numbers the model actually transcribed, catching a level it
+    # invented rather than read — internally consistent (SL > entry > TP)
+    # but not a number anywhere on the chart.
+    price_axis_labels: Optional[list[float]] = None
 
 
 class TradeData(BaseModel):
@@ -680,6 +688,16 @@ active_position (its direction, and its entry/stop_loss/take_profit if you can \
 read them). If there is no such position, or the position you returned above is \
 itself the running one, leave active_position null.
 
+CHECK YOUR OWN READING:
+Set price_axis_labels to every distinct price number actually printed next to \
+the right price axis for the position tool you read above — its entry, stop \
+loss and take profit labels, plus the current-price label. Transcribe these \
+literally, the way you would copy text off the image. Then re-read what you \
+put in entry, stop_loss and take_profit: each one must equal a number you just \
+listed in price_axis_labels, not a value you computed, rounded, or estimated \
+from the gap between two boxes. If one doesn't match, you misread the chart — \
+go back and find which label actually belongs to it before answering.
+
 Extract only the raw values. Do NOT calculate anything. Do NOT write a message. \
 Return only the structured data.
 
@@ -724,6 +742,26 @@ def parse_analysis(content: str) -> ChartAnalysis:
         return ChartAnalysis.model_validate_json(content)
     except ValueError as error:  # pydantic's ValidationError is a ValueError
         raise VisionAPIError(f"Unusable reply: {error}", retryable=True) from error
+
+
+def labels_support_reading(analysis: ChartAnalysis) -> bool:
+    """False when entry/SL/TP aren't among the labels the model transcribed.
+
+    A level the model computed or guessed instead of reading — e.g. an SL it
+    invented one box-width above the entry — usually isn't one of the actual
+    numbers printed on the chart, even though it can still look like a
+    perfectly ordered SHORT/LONG setup. Silent when the model didn't return
+    any labels, so this only tightens readings that offer something to check.
+    """
+    labels = analysis.price_axis_labels
+    if not analysis.is_trading_chart or not labels:
+        return True
+
+    def seen(price: Optional[float]) -> bool:
+        return price is None or any(
+            math.isclose(price, label, rel_tol=0.0005) for label in labels)
+
+    return seen(analysis.entry) and seen(analysis.stop_loss) and seen(analysis.take_profit)
 
 
 def request_gemini_analysis(
@@ -832,6 +870,17 @@ def extract_chart_analysis(image_bytes: bytes, mime_type: str) -> ChartAnalysis:
                                    provider, model, attempt, error)
                     if getattr(error, "retry_after", None):
                         waits.append(error.retry_after)
+                    continue
+
+                if not labels_support_reading(analysis):
+                    logger.warning(
+                        "%s %s misread the chart (attempt %d): entry=%s sl=%s "
+                        "tp=%s not among labels %s", provider, model, attempt,
+                        analysis.entry, analysis.stop_loss, analysis.take_profit,
+                        analysis.price_axis_labels)
+                    last_error = VisionAPIError(
+                        "Levels didn't match the chart's own price labels",
+                        retryable=True)
                     continue
 
                 if attempt > 1 or (provider, model) != VISION_MODELS[0]:
@@ -2654,6 +2703,55 @@ async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         summarize_results(results_since(message.chat_id, since, records), title))
 
 
+async def news_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/news [asset] — debug: inspect the news feed without waiting for a
+    real event to land inside the 4h trigger window."""
+    message = update.effective_message
+    events = await high_impact_events()
+    if not events:
+        await message.reply_text(
+            "No high-impact events cached — the calendar fetch may have "
+            'failed. Check the logs for "Could not fetch the news calendar".'
+        )
+        return
+    now = datetime.now(dt_timezone.utc)
+
+    def describe(event: dict) -> str:
+        minutes = int((event["when"] - now).total_seconds() // 60)
+        until = f"{minutes // 60}h {minutes % 60}m" if minutes >= 60 else f"{minutes}m"
+        at = event["when"].astimezone(LOCAL_TZ).strftime("%a %H:%M")
+        flag = " ✅ within 4h window" if 0 <= minutes <= NEWS_WINDOW_HOURS * 60 else ""
+        return f"• {event['country']} {event['title']} at {at} (in {until}){flag}"
+
+    if not context.args:
+        upcoming = sorted((e for e in events if e["when"] >= now), key=lambda e: e["when"])
+        await message.reply_text(
+            f"📰 {len(events)} high-impact events cached this week. Next up:\n"
+            + ("\n".join(describe(e) for e in upcoming[:10]) if upcoming else "None upcoming.")
+            + "\n\nUse /news <asset> to see what would warn for a specific symbol."
+        )
+        return
+
+    asset = context.args[0]
+    currencies = news_currencies(asset) | {"All"}
+    relevant = sorted(
+        (e for e in events if e.get("country") in currencies and e["when"] >= now),
+        key=lambda e: e["when"],
+    )
+    header = f"📰 {asset.upper()} watches: {', '.join(sorted(currencies))}\n"
+    if not relevant:
+        await message.reply_text(header + "No upcoming high-impact events this week.")
+        return
+    would_warn = await news_warning(asset)
+    footer = (
+        f"\n\nWould send right now:\n{would_warn}" if would_warn
+        else "\n\nNothing within the 4h window right now — no warning would be sent."
+    )
+    await message.reply_text(
+        header + "\n".join(describe(e) for e in relevant[:10]) + footer
+    )
+
+
 async def weekly_summary(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Sunday evening: the week's results to every chat that closed a trade."""
     week = datetime.now(LOCAL_TZ).strftime("%G-W%V")
@@ -3056,6 +3154,7 @@ def main() -> None:
     app.add_handler(CommandHandler("trades", list_trades))
     app.add_handler(CommandHandler("cancel", cancel_trade))
     app.add_handler(CommandHandler("stats", show_stats))
+    app.add_handler(CommandHandler("news", news_debug))
     app.add_handler(CallbackQueryHandler(correct_trade, pattern=r"^(in|wait):"))
     app.add_handler(CallbackQueryHandler(watch_running_trade, pattern=r"^run:"))
     # Replies to the bot's trade messages edit that trade ("sl 4170", "be"...)
